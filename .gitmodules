@@ -1,0 +1,3 @@
+[submodule "cryptol-specs"]
+	path = cryptol-specs
+	url = git@github.com:GaloisInc/cryptol-specs.git
