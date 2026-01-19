@@ -1,0 +1,30 @@
+import "../cryptol-specs/Primitive/Symmetric/Cipher/Block/AES/Instantiations/AES128.cry" as AES128;
+import "FixSlice64.cry";
+
+m <- mir_load_module "target/aarch64-apple-darwin/debug/deps/aes_verif-666e6a482162eaef.linked-mir.json";
+
+let bitslice_spec = do {
+    output_init <- mir_fresh_var "output_init" (mir_array 8 mir_u64);
+    output_ref <- mir_ref_of_mut (mir_term output_init);
+    input0 <- mir_fresh_var "input0" (mir_array 16 mir_u8);
+    input0_ref <- mir_ref_of (mir_term input0);
+    input1 <- mir_fresh_var "input1" (mir_array 16 mir_u8);
+    input1_ref <- mir_ref_of (mir_term input1);
+    input2 <- mir_fresh_var "input2" (mir_array 16 mir_u8);
+    input2_ref <- mir_ref_of (mir_term input2);
+    input3 <- mir_fresh_var "input3" (mir_array 16 mir_u8);
+    input3_ref <- mir_ref_of (mir_term input3);
+    mir_execute_func [mir_slice_value output_ref, mir_slice_value input0_ref, mir_slice_value input1_ref, mir_slice_value input2_ref, mir_slice_value input3_ref];
+    mir_points_to output_ref (mir_term {{ bitslice_littleendian [input0, input1, input2, input3] }});
+};
+
+bitslice_ov <- mir_verify m "aes::soft::fixslice::bitslice" [] false bitslice_spec z3;
+
+let encrypt128_spec = do {
+    key <- mir_fresh_var "key" (mir_array 16 mir_u8);
+    block <- mir_fresh_var "block" (mir_array 16 mir_u8);
+    mir_execute_func [mir_term key, mir_term block];
+    mir_return (mir_term {{ split`{16} (AES128::encrypt (join key) (join block)) }});
+};
+
+mir_verify m "aes_verif::encrypt128" [bitslice_ov] false encrypt128_spec z3;

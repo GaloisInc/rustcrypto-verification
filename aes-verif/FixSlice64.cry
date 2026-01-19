@@ -1,0 +1,36 @@
+module FixSlice64 where
+
+bitslice : [4][16][8] -> [8][64]
+bitslice bb_ccrr_ppp = ppp_rrccbb
+  where
+  ccrr_bb_ppp : [16][4][8]
+  ccrr_bb_ppp = transpose bb_ccrr_ppp
+  ccrrbb_ppp : [64][8]
+  ccrrbb_ppp = join ccrr_bb_ppp
+  ppp_ccrrbb : [8][64]
+  ppp_ccrrbb = transpose ccrrbb_ppp
+  ppp_cc_rr_bb : [8][4][4][4]
+  ppp_cc_rr_bb = [map split (split ccrrbb) | ccrrbb <- ppp_ccrrbb]
+  ppp_rr_cc_bb : [8][4][4][4]
+  ppp_rr_cc_bb = map transpose ppp_cc_rr_bb
+  ppp_rrccbb : [8][64]
+  ppp_rrccbb = [join (map join rr_cc_bb) | rr_cc_bb <- ppp_rr_cc_bb]
+
+/*
+
+0   4   8   12
+1   5   9   13
+2   6   10  14
+3   7   11  15
+
+*/
+
+bitslice_correct : [4][16][8] -> [2] -> [2] -> [2] -> [3] -> Bit
+property bitslice_correct input block row col bit =
+  input @ block @ (zext col * 4 + zext row : [4]) @ bit
+  == output @ bit @ (zext row * 16 + zext col * 4 + zext block : [16])
+  where
+  output = bitslice input
+
+bitslice_littleendian : [4][16][8] -> [8][64]
+bitslice_littleendian input = map reverse (bitslice (map (map reverse) input))
