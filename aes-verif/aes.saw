@@ -118,53 +118,17 @@ let mix_columns_spec cry_fun = do {
     mir_points_to state_ref (mir_term {{ cry_fun state_init }});
 };
 
-/*
-let mix_columns_0_spec = do {
-    state_init <- mir_fresh_var "state_init" (mir_array 8 mir_u64);
-    state_ref <- mir_ref_of_mut (mir_term state_init);
-    mir_execute_func [state_ref];
-    mir_points_to state_ref (mir_term {{ mix_columns_0 state_init }});
-};
-*/
-
 mix_columns_0_ov <-
     mir_verify m "aes::soft::fixslice::mix_columns_0" [] false
         (mix_columns_spec {{ mix_columns_0 }}) rme;
-
-/*
-let mix_columns_1_spec = do {
-    state_init <- mir_fresh_var "state_init" (mir_array 8 mir_u64);
-    state_ref <- mir_ref_of_mut (mir_term state_init);
-    mir_execute_func [state_ref];
-    mir_points_to state_ref (mir_term {{ mix_columns_1 state_init }});
-};
-*/
 
 mix_columns_1_ov <-
     mir_verify m "aes::soft::fixslice::mix_columns_1" [] false
         (mix_columns_spec {{ mix_columns_1 }}) rme;
 
-/*
-let mix_columns_2_spec = do {
-    state_init <- mir_fresh_var "state_init" (mir_array 8 mir_u64);
-    state_ref <- mir_ref_of_mut (mir_term state_init);
-    mir_execute_func [state_ref];
-    mir_points_to state_ref (mir_term {{ mix_columns_2 state_init }});
-};
-*/
-
 mix_columns_2_ov <-
     mir_verify m "aes::soft::fixslice::mix_columns_2" [] false
         (mix_columns_spec {{ mix_columns_2 }}) rme;
-
-/*
-let mix_columns_3_spec = do {
-    state_init <- mir_fresh_var "state_init" (mir_array 8 mir_u64);
-    state_ref <- mir_ref_of_mut (mir_term state_init);
-    mir_execute_func [state_ref];
-    mir_points_to state_ref (mir_term {{ mix_columns_3 state_init }});
-};
-*/
 
 mix_columns_3_ov <-
     mir_verify m "aes::soft::fixslice::mix_columns_3" [] false
