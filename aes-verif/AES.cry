@@ -1,0 +1,6 @@
+module AES where
+
+import Primitive::Symmetric::Cipher::Block::AES::Instantiations::AES128 as AES128
+
+encrypt128 : [16][8] -> [16][8] -> [16][8]
+encrypt128 key block = split (AES128::encrypt (join key) (join block))

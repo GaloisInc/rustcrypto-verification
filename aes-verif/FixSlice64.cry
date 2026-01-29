@@ -1,7 +1,9 @@
 module FixSlice64 where
 
-bitslice : [4][16][8] -> [8][64]
-bitslice bb_ccrr_ppp = ppp_rrccbb
+import Primitive::Symmetric::Cipher::Block::AES::Instantiations::AES128 as AES128
+
+bitslice_big_endian : [4][16][8] -> [8][64]
+bitslice_big_endian bb_ccrr_ppp = ppp_rrccbb
   where
   ccrr_bb_ppp : [16][4][8]
   ccrr_bb_ppp = transpose bb_ccrr_ppp
@@ -10,19 +12,17 @@ bitslice bb_ccrr_ppp = ppp_rrccbb
   ppp_ccrrbb : [8][64]
   ppp_ccrrbb = transpose ccrrbb_ppp
   ppp_cc_rr_bb : [8][4][4][4]
-  ppp_cc_rr_bb = [map split (split ccrrbb) | ccrrbb <- ppp_ccrrbb]
+  ppp_cc_rr_bb = [split (split ccrrbb) | ccrrbb <- ppp_ccrrbb]
   ppp_rr_cc_bb : [8][4][4][4]
   ppp_rr_cc_bb = map transpose ppp_cc_rr_bb
   ppp_rrccbb : [8][64]
-  ppp_rrccbb = [join (map join rr_cc_bb) | rr_cc_bb <- ppp_rr_cc_bb]
+  ppp_rrccbb = [join (join rr_cc_bb) | rr_cc_bb <- ppp_rr_cc_bb]
 
 /*
-
 0   4   8   12
 1   5   9   13
 2   6   10  14
 3   7   11  15
-
 */
 
 bitslice_correct : [4][16][8] -> [2] -> [2] -> [2] -> [3] -> Bit
@@ -30,7 +30,74 @@ property bitslice_correct input block row col bit =
   input @ block @ (zext col * 4 + zext row : [4]) @ bit
   == output @ bit @ (zext row * 16 + zext col * 4 + zext block : [16])
   where
-  output = bitslice input
+  output = bitslice_big_endian input
 
-bitslice_littleendian : [4][16][8] -> [8][64]
-bitslice_littleendian input = map reverse (bitslice (map (map reverse) input))
+bitslice : [4][16][8] -> [8][64]
+bitslice input = map reverse (bitslice_big_endian (map (map reverse) input))
+
+inv_bitslice_big_endian : [8][64] -> [4][16][8]
+inv_bitslice_big_endian ppp_rrccbb = bb_ccrr_ppp
+  where
+  ppp_rr_cc_bb : [8][4][4][4]
+  ppp_rr_cc_bb = [split (split rrccbb) | rrccbb <- ppp_rrccbb]
+  ppp_cc_rr_bb : [8][4][4][4]
+  ppp_cc_rr_bb = map transpose ppp_rr_cc_bb
+  ppp_ccrrbb : [8][64]
+  ppp_ccrrbb = [join (join cc_rr_bb) | cc_rr_bb <- ppp_cc_rr_bb]
+  ccrrbb_ppp : [64][8]
+  ccrrbb_ppp = transpose ppp_ccrrbb
+  ccrr_bb_ppp : [16][4][8]
+  ccrr_bb_ppp = split ccrrbb_ppp
+  bb_ccrr_ppp : [4][16][8]
+  bb_ccrr_ppp = transpose ccrr_bb_ppp
+
+inv_bitslice_correct : [4][16][8] -> Bit
+property inv_bitslice_correct input =
+  inv_bitslice_big_endian (bitslice_big_endian input) == input
+
+inv_bitslice : [8][64] -> [4][16][8]
+inv_bitslice input =
+  map (map reverse) (inv_bitslice_big_endian (map reverse input))
+
+sub_bytes_nots : [8][64] -> [8][64]
+sub_bytes_nots [s0, s1, s2, s3, s4, s5, s6, s7] =
+  [~s0, ~s1, s2, s3, s4, ~s5, ~s6, s7]
+
+bitsliced : ([4][16][8] -> [4][16][8]) -> [8][64] -> [8][64]
+bitsliced f x = bitslice (f (inv_bitslice x))
+
+stateTransformation : (AES128::State -> AES128::State)
+                   -> [4][16][8] -> [4][16][8]
+stateTransformation f blocks =
+  [join (transpose (f (transpose (split block)))) | block <- blocks]
+
+sub_bytes : [8][64] -> [8][64]
+sub_bytes bitsliced_state =
+  sub_bytes_nots
+    (bitsliced (stateTransformation AES128::SubBytes) bitsliced_state)
+
+mix_columns_0 : [8][64] -> [8][64]
+mix_columns_0 = bitsliced (stateTransformation AES128::MixColumns)
+
+mix_columns_1 : [8][64] -> [8][64]
+mix_columns_1 =
+  bitsliced
+    (stateTransformation
+      (\state ->
+        AES128::InvShiftRows (AES128::MixColumns (AES128::ShiftRows state))))
+
+mix_columns_2 : [8][64] -> [8][64]
+mix_columns_2 =
+  bitsliced
+    (stateTransformation
+      (\state ->
+        (AES128::ShiftRows (AES128::ShiftRows
+          (AES128::MixColumns
+            (AES128::ShiftRows (AES128::ShiftRows state)))))))
+
+mix_columns_3 : [8][64] -> [8][64]
+mix_columns_3 =
+  bitsliced
+    (stateTransformation
+      (\state ->
+        AES128::ShiftRows (AES128::MixColumns (AES128::InvShiftRows state))))

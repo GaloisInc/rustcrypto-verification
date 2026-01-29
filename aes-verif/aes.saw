@@ -1,7 +1,32 @@
-import "../cryptol-specs/Primitive/Symmetric/Cipher/Block/AES/Instantiations/AES128.cry" as AES128;
 import "FixSlice64.cry";
+import "AES.cry";
 
 m <- mir_load_module "target/aarch64-apple-darwin/debug/deps/aes_verif-666e6a482162eaef.linked-mir.json";
+
+let UInt = mir_find_adt m "typenum::uint::UInt";
+let UTerm = mir_find_adt m "typenum::uint::UTerm" [];
+let B1 = mir_find_adt m "typenum::bit::B1" [];
+let B0 = mir_find_adt m "typenum::bit::B0" [];
+let U4 = UInt [
+    mir_adt (UInt [
+        mir_adt (UInt [
+            mir_adt UTerm,
+            mir_adt B1
+        ]),
+        mir_adt B0
+    ]),
+    mir_adt B0
+];
+let U16 = UInt [
+    mir_adt (UInt [
+        mir_adt U4,
+        mir_adt B0
+    ]),
+    mir_adt B0
+];
+let Array = mir_find_adt m "hybrid_array::Array";
+let Block = Array [mir_u8, mir_adt U16];
+let BatchBlocks = Array [mir_adt Block, mir_adt U4];
 
 let bitslice_spec = do {
     output_init <- mir_fresh_var "output_init" (mir_array 8 mir_u64);
@@ -14,17 +39,156 @@ let bitslice_spec = do {
     input2_ref <- mir_ref_of (mir_term input2);
     input3 <- mir_fresh_var "input3" (mir_array 16 mir_u8);
     input3_ref <- mir_ref_of (mir_term input3);
-    mir_execute_func [mir_slice_value output_ref, mir_slice_value input0_ref, mir_slice_value input1_ref, mir_slice_value input2_ref, mir_slice_value input3_ref];
-    mir_points_to output_ref (mir_term {{ bitslice_littleendian [input0, input1, input2, input3] }});
+    mir_execute_func [
+        mir_slice_value output_ref,
+        mir_slice_value input0_ref,
+        mir_slice_value input1_ref,
+        mir_slice_value input2_ref,
+        mir_slice_value input3_ref
+    ];
+    mir_points_to output_ref (mir_term {{
+        bitslice [input0, input1, input2, input3]
+    }});
 };
 
-bitslice_ov <- mir_verify m "aes::soft::fixslice::bitslice" [] false bitslice_spec z3;
+mir_verify m "aes::soft::fixslice::bitslice" [] false bitslice_spec rme;
+
+let inv_bitslice_spec = do {
+    input <- mir_fresh_var "input" (mir_array 8 mir_u64);
+    input_ref <- mir_ref_of (mir_term input);
+    mir_execute_func [mir_slice_value input_ref];
+    let output = {{ inv_bitslice input }};
+    mir_return (mir_struct_value BatchBlocks [
+        mir_array_value (mir_adt Block) [
+            mir_struct_value Block [mir_term {{ output @ 0 }}],
+            mir_struct_value Block [mir_term {{ output @ 1 }}],
+            mir_struct_value Block [mir_term {{ output @ 2 }}],
+            mir_struct_value Block [mir_term {{ output @ 3 }}]
+        ]
+    ]);
+};
+
+mir_verify m "aes::soft::fixslice::inv_bitslice" [] false inv_bitslice_spec rme;
+
+let sub_bytes_nots_spec = do {
+    state <- mir_fresh_var "state" (mir_array 8 mir_u64);
+    state_ref <- mir_ref_of_mut (mir_term state);
+    mir_execute_func [mir_slice_value state_ref];
+    mir_points_to state_ref (mir_term {{ sub_bytes_nots state }});
+};
+
+mir_verify m "aes::soft::fixslice::sub_bytes_nots" [] false
+    sub_bytes_nots_spec rme;
+
+let sub_bytes_spec = do {
+    state_init <- mir_fresh_var "state_init" (mir_array 8 mir_u64);
+    state_ref <- mir_ref_of_mut (mir_term state_init);
+    mir_execute_func [mir_slice_value state_ref];
+    mir_points_to state_ref (mir_term {{ sub_bytes state_init }});
+};
+
+sub_bytes_ov <-
+    mir_verify m "aes::soft::fixslice::sub_bytes" [] false sub_bytes_spec rme;
+
+let sub_bytes_key_spec rcon = do {
+    rkeys_init <- mir_fresh_var "rkeys" (mir_array 88 mir_u64);
+    rkeys_ref <- mir_ref_of_mut (mir_term rkeys_init);
+    mir_execute_func [
+        mir_slice_range_value rkeys_ref
+            (eval_size {| rcon * 8 |})
+            (eval_size {| (rcon + 1) * 8 |})
+    ];
+    mir_points_to rkeys_ref (mir_term {{
+        take`{rcon * 8} rkeys_init
+        # sub_bytes (take`{8} (drop`{rcon * 8} rkeys_init))
+        # drop`{(rcon + 1) * 8} rkeys_init
+    }});
+};
+
+sub_bytes_key_ovs <-
+    for (eval_list {{ [0..10] : [_][64] }}) (\rcon ->
+        mir_verify m "aes::soft::fixslice::sub_bytes" [] false
+            (sub_bytes_key_spec (eval_int rcon)) rme
+    );
+
+let mix_columns_spec cry_fun = do {
+    state_init <- mir_fresh_var "state_init" (mir_array 8 mir_u64);
+    state_ref <- mir_ref_of_mut (mir_term state_init);
+    mir_execute_func [state_ref];
+    mir_points_to state_ref (mir_term {{ cry_fun state_init }});
+};
+
+/*
+let mix_columns_0_spec = do {
+    state_init <- mir_fresh_var "state_init" (mir_array 8 mir_u64);
+    state_ref <- mir_ref_of_mut (mir_term state_init);
+    mir_execute_func [state_ref];
+    mir_points_to state_ref (mir_term {{ mix_columns_0 state_init }});
+};
+*/
+
+mix_columns_0_ov <-
+    mir_verify m "aes::soft::fixslice::mix_columns_0" [] false
+        (mix_columns_spec {{ mix_columns_0 }}) rme;
+
+/*
+let mix_columns_1_spec = do {
+    state_init <- mir_fresh_var "state_init" (mir_array 8 mir_u64);
+    state_ref <- mir_ref_of_mut (mir_term state_init);
+    mir_execute_func [state_ref];
+    mir_points_to state_ref (mir_term {{ mix_columns_1 state_init }});
+};
+*/
+
+mix_columns_1_ov <-
+    mir_verify m "aes::soft::fixslice::mix_columns_1" [] false
+        (mix_columns_spec {{ mix_columns_1 }}) rme;
+
+/*
+let mix_columns_2_spec = do {
+    state_init <- mir_fresh_var "state_init" (mir_array 8 mir_u64);
+    state_ref <- mir_ref_of_mut (mir_term state_init);
+    mir_execute_func [state_ref];
+    mir_points_to state_ref (mir_term {{ mix_columns_2 state_init }});
+};
+*/
+
+mix_columns_2_ov <-
+    mir_verify m "aes::soft::fixslice::mix_columns_2" [] false
+        (mix_columns_spec {{ mix_columns_2 }}) rme;
+
+/*
+let mix_columns_3_spec = do {
+    state_init <- mir_fresh_var "state_init" (mir_array 8 mir_u64);
+    state_ref <- mir_ref_of_mut (mir_term state_init);
+    mir_execute_func [state_ref];
+    mir_points_to state_ref (mir_term {{ mix_columns_3 state_init }});
+};
+*/
+
+mix_columns_3_ov <-
+    mir_verify m "aes::soft::fixslice::mix_columns_3" [] false
+        (mix_columns_spec {{ mix_columns_3 }}) rme;
 
 let encrypt128_spec = do {
     key <- mir_fresh_var "key" (mir_array 16 mir_u8);
     block <- mir_fresh_var "block" (mir_array 16 mir_u8);
     mir_execute_func [mir_term key, mir_term block];
-    mir_return (mir_term {{ split`{16} (AES128::encrypt (join key) (join block)) }});
+    mir_return (mir_term {{ encrypt128 key block }});
 };
 
-mir_verify m "aes_verif::encrypt128" [bitslice_ov] false encrypt128_spec z3;
+let encrypt128_ovs =
+    concat
+        sub_bytes_key_ovs
+        [
+            sub_bytes_ov,
+            mix_columns_0_ov,
+            mix_columns_1_ov,
+            mix_columns_2_ov,
+            mix_columns_3_ov
+        ];
+mir_verify m "aes_verif::encrypt128" encrypt128_ovs false encrypt128_spec
+    do {
+        // print_goal_depth 3;
+        unint_z3 ["SubBytes", "MixColumns"];
+    };
