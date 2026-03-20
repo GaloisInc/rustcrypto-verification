@@ -59,10 +59,6 @@ inv_bitslice : [8][64] -> [4][16][8]
 inv_bitslice input =
   map (map reverse) (inv_bitslice_big_endian (map reverse input))
 
-sub_bytes_nots : [8][64] -> [8][64]
-sub_bytes_nots [s0, s1, s2, s3, s4, s5, s6, s7] =
-  [~s0, ~s1, s2, s3, s4, ~s5, ~s6, s7]
-
 bitsliced : ([4][16][8] -> [4][16][8]) -> [8][64] -> [8][64]
 bitsliced f x = bitslice (f (inv_bitslice x))
 
@@ -71,33 +67,88 @@ stateTransformation : (AES128::State -> AES128::State)
 stateTransformation f blocks =
   [join (transpose (f (transpose (split block)))) | block <- blocks]
 
+add_round_key : [8][64] -> [8][64] -> [8][64]
+add_round_key bitsliced_state round_key =
+  bitsliced (addRoundKey' (inv_bitslice round_key)) bitsliced_state
+
+addRoundKey' : [4][16][8] -> [4][16][8] -> [4][16][8]
+addRoundKey' roundKeys blocks =
+  [ join (transpose (AES128::AddRoundKey (transpose (split rk)) (transpose (split block))))
+  | block <- blocks
+  | rk <- roundKeys
+  ]
+
+SubBytesNots : AES128::State -> AES128::State
+SubBytesNots state = [[b ^ 0x63 | b <- row] | row <- state]
+
+sub_bytes_nots : [8][64] -> [8][64]
+sub_bytes_nots [s0, s1, s2, s3, s4, s5, s6, s7] =
+  [~s0, ~s1, s2, s3, s4, ~s5, ~s6, s7]
+
 sub_bytes : [8][64] -> [8][64]
-sub_bytes bitsliced_state =
-  sub_bytes_nots
-    (bitsliced (stateTransformation AES128::SubBytes) bitsliced_state)
+sub_bytes =
+  bitsliced
+    (stateTransformation
+      (\state -> SubBytesNots (AES128::SubBytes state)))
 
 mix_columns_0 : [8][64] -> [8][64]
 mix_columns_0 = bitsliced (stateTransformation AES128::MixColumns)
 
 mix_columns_1 : [8][64] -> [8][64]
-mix_columns_1 =
-  bitsliced
-    (stateTransformation
-      (\state ->
-        AES128::InvShiftRows (AES128::MixColumns (AES128::ShiftRows state))))
+mix_columns_1 = bitsliced (stateTransformation MixColumns1)
+
+MixColumns1 : AES128::State -> AES128::State
+MixColumns1 state =
+  AES128::InvShiftRows (AES128::MixColumns (AES128::ShiftRows state))
 
 mix_columns_2 : [8][64] -> [8][64]
-mix_columns_2 =
-  bitsliced
-    (stateTransformation
-      (\state ->
-        (AES128::ShiftRows (AES128::ShiftRows
-          (AES128::MixColumns
-            (AES128::ShiftRows (AES128::ShiftRows state)))))))
+mix_columns_2 = bitsliced (stateTransformation MixColumns2)
+
+MixColumns2 : AES128::State -> AES128::State
+MixColumns2 state =
+  AES128::ShiftRows
+    (AES128::ShiftRows
+      (AES128::MixColumns
+        (AES128::ShiftRows
+          (AES128::ShiftRows state))))
 
 mix_columns_3 : [8][64] -> [8][64]
-mix_columns_3 =
+mix_columns_3 = bitsliced (stateTransformation MixColumns3)
+
+MixColumns3 : AES128::State -> AES128::State
+MixColumns3 state =
+  AES128::ShiftRows (AES128::MixColumns (AES128::InvShiftRows state))
+
+shift_rows_1 : [8][64] -> [8][64]
+shift_rows_1 = bitsliced (stateTransformation AES128::ShiftRows)
+
+shift_rows_2 : [8][64] -> [8][64]
+shift_rows_2 =
   bitsliced
     (stateTransformation
-      (\state ->
-        AES128::ShiftRows (AES128::MixColumns (AES128::InvShiftRows state))))
+      (\state -> AES128::ShiftRows (AES128::ShiftRows state)))
+
+shift_rows_3 : [8][64] -> [8][64]
+shift_rows_3 = bitsliced (stateTransformation AES128::InvShiftRows)
+
+inv_shift_rows_1 : [8][64] -> [8][64]
+inv_shift_rows_1 = shift_rows_3
+
+inv_shift_rows_2 : [8][64] -> [8][64]
+inv_shift_rows_2 = shift_rows_2
+
+inv_shift_rows_3 : [8][64] -> [8][64]
+inv_shift_rows_3 = shift_rows_1
+
+aes128_key_schedule : [16][8] -> [88][64]
+aes128_key_schedule key =
+  join [ w0, sub_bytes_nots (inv_shift_rows_1 w1), sub_bytes_nots (inv_shift_rows_2 w2), sub_bytes_nots (inv_shift_rows_3 w3)
+       , sub_bytes_nots w4, sub_bytes_nots (inv_shift_rows_1 w5), sub_bytes_nots (inv_shift_rows_2 w6), sub_bytes_nots (inv_shift_rows_3 w7)
+       , sub_bytes_nots w8, sub_bytes_nots (inv_shift_rows_1 w9)
+       , sub_bytes_nots w10
+       ]
+  where
+    [w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10] =
+      [ bitslice (repeat (join (transpose rk)))
+      | rk <- AES128::keyExpansion (join key)
+      ]
