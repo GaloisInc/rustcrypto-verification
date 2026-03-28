@@ -310,7 +310,6 @@ thm_stateTransformation_composition <- prove_print
 
 thms_MixColumnsN_SubBytesNots <-
     for [{{AES128::MixColumns}}, {{MixColumns1}}, {{MixColumns2}}, {{MixColumns3}}] (\mixColumns -> do {
-        print "asdf";
         prove_print z3 {{
             \(state : AES128::State) ->
                 mixColumns (SubBytesNots state) == SubBytesNots (mixColumns state)
@@ -402,7 +401,6 @@ thm_foo <- prove_print
 
 thms_foo0 <-
     for [4, 8, 10] (\i -> do {
-        print i;
         prove_print
             do {
                 unint_z3 ["keyExpansion"];
@@ -417,7 +415,6 @@ thms_foo0 <-
 
 thms_foo1 <-
     for [1, 5, 9] (\i -> do {
-        print i;
         prove_print
             do {
                 unint_z3 ["keyExpansion"];
@@ -432,7 +429,6 @@ thms_foo1 <-
 
 thms_foo2 <-
     for [2, 6] (\i -> do {
-        print i;
         prove_print
             do {
                 unint_z3 ["keyExpansion"];
@@ -447,7 +443,6 @@ thms_foo2 <-
 
 thms_foo3 <-
     for [3, 7] (\i -> do {
-        print i;
         prove_print
             do {
                 unint_z3 ["keyExpansion"];
