@@ -9,7 +9,7 @@ let my_verify m f ovs ps spec tac =
     mir_unsafe_assume_spec m f spec
     ;
 
-m <- mir_load_module "target/aarch64-apple-darwin/debug/deps/aes_verif-666e6a482162eaef.linked-mir.json";
+m <- mir_load_module "target/aarch64-apple-darwin/debug/deps/aes_verif-a7726c0105e8b76e.linked-mir.json";
 
 let UInt = mir_find_adt m "typenum::uint::UInt";
 let UTerm = mir_find_adt m "typenum::uint::UTerm" [];
@@ -32,9 +32,9 @@ let U16 = UInt [
     ]),
     mir_adt B0
 ];
-let Array = mir_find_adt m "hybrid_array::Array";
-let Block = Array [mir_u8, mir_adt U16];
-let BatchBlocks = Array [mir_adt Block, mir_adt U4];
+let GenericArray = mir_find_adt m "generic_array::GenericArray";
+let Block = GenericArray [mir_u8, mir_adt U16];
+let BatchBlocks = GenericArray [mir_adt Block, mir_adt U4];
 
 let bitslice_encrypt_spec = do {
     output_init <- mir_fresh_var "output_init" (mir_array 8 mir_u64);
@@ -51,10 +51,10 @@ let bitslice_encrypt_spec = do {
     ]);
     mir_execute_func [
         mir_slice_value output_ref,
-        mir_slice_value (mir_field_ref (mir_elem_ref blocks_ref 0) "0"),
-        mir_slice_value (mir_field_ref (mir_elem_ref blocks_ref 1) "0"),
-        mir_slice_value (mir_field_ref (mir_elem_ref blocks_ref 2) "0"),
-        mir_slice_value (mir_field_ref (mir_elem_ref blocks_ref 3) "0")
+        mir_slice_value (mir_field_ref (mir_elem_ref blocks_ref 0) "data"),
+        mir_slice_value (mir_field_ref (mir_elem_ref blocks_ref 1) "data"),
+        mir_slice_value (mir_field_ref (mir_elem_ref blocks_ref 2) "data"),
+        mir_slice_value (mir_field_ref (mir_elem_ref blocks_ref 3) "data")
     ];
     mir_points_to output_ref (mir_term {{
         bitslice [block0, block1, block2, block3]

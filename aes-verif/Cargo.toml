@@ -4,4 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-aes = "0.9.0-rc.2"
+aes = { git = "https://github.com/RyanGlScott/block-ciphers.git", branch = "backport-hybrid-arrays-to-aes-0.8.4" }
+
+[patch.crates-io]
+generic-array = { git = "https://github.com/RyanGlScott/generic-array.git", branch = "backport-hybrid-arrays-to-generic-array-0.14.7" }
