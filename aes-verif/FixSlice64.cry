@@ -2,8 +2,8 @@ module FixSlice64 where
 
 import Primitive::Symmetric::Cipher::Block::AES::Instantiations::AES128 as AES128
 
-bitslice_big_endian : [4][16][8] -> [8][64]
-bitslice_big_endian bb_ccrr_ppp = ppp_rrccbb
+bitslice_msb_first : [4][16][8] -> [8][64]
+bitslice_msb_first bb_ccrr_ppp = ppp_rrccbb
   where
   ccrr_bb_ppp : [16][4][8]
   ccrr_bb_ppp = transpose bb_ccrr_ppp
@@ -18,25 +18,18 @@ bitslice_big_endian bb_ccrr_ppp = ppp_rrccbb
   ppp_rrccbb : [8][64]
   ppp_rrccbb = [join (join rr_cc_bb) | rr_cc_bb <- ppp_rr_cc_bb]
 
-/*
-0   4   8   12
-1   5   9   13
-2   6   10  14
-3   7   11  15
-*/
-
 bitslice_correct : [4][16][8] -> [2] -> [2] -> [2] -> [3] -> Bit
 property bitslice_correct input block row col bit =
   input @ block @ (zext col * 4 + zext row : [4]) @ bit
   == output @ bit @ (zext row * 16 + zext col * 4 + zext block : [16])
   where
-  output = bitslice_big_endian input
+  output = bitslice_msb_first input
 
 bitslice : [4][16][8] -> [8][64]
-bitslice input = map reverse (bitslice_big_endian (map (map reverse) input))
+bitslice input = map reverse (bitslice_msb_first (map (map reverse) input))
 
-inv_bitslice_big_endian : [8][64] -> [4][16][8]
-inv_bitslice_big_endian ppp_rrccbb = bb_ccrr_ppp
+inv_bitslice_msb_first : [8][64] -> [4][16][8]
+inv_bitslice_msb_first ppp_rrccbb = bb_ccrr_ppp
   where
   ppp_rr_cc_bb : [8][4][4][4]
   ppp_rr_cc_bb = [split (split rrccbb) | rrccbb <- ppp_rrccbb]
@@ -53,11 +46,11 @@ inv_bitslice_big_endian ppp_rrccbb = bb_ccrr_ppp
 
 inv_bitslice_correct : [4][16][8] -> Bit
 property inv_bitslice_correct input =
-  inv_bitslice_big_endian (bitslice_big_endian input) == input
+  inv_bitslice_msb_first (bitslice_msb_first input) == input
 
 inv_bitslice : [8][64] -> [4][16][8]
 inv_bitslice input =
-  map (map reverse) (inv_bitslice_big_endian (map reverse input))
+  map (map reverse) (inv_bitslice_msb_first (map reverse input))
 
 bitsliced : ([4][16][8] -> [4][16][8]) -> [8][64] -> [8][64]
 bitsliced f x = bitslice (f (inv_bitslice x))
