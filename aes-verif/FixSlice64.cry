@@ -84,6 +84,12 @@ sub_bytes =
     (stateTransformation
       (\state -> SubBytesNots (AES128::SubBytes state)))
 
+inv_sub_bytes : [8][64] -> [8][64]
+inv_sub_bytes =
+  bitsliced
+    (stateTransformation
+      (\state -> AES128::InvSubBytes (SubBytesNots state)))
+
 mix_columns_0 : [8][64] -> [8][64]
 mix_columns_0 = bitsliced (stateTransformation AES128::MixColumns)
 
@@ -111,6 +117,34 @@ mix_columns_3 = bitsliced (stateTransformation MixColumns3)
 MixColumns3 : AES128::State -> AES128::State
 MixColumns3 state =
   AES128::ShiftRows (AES128::MixColumns (AES128::InvShiftRows state))
+
+inv_mix_columns_0 : [8][64] -> [8][64]
+inv_mix_columns_0 = bitsliced (stateTransformation AES128::InvMixColumns)
+
+inv_mix_columns_1 : [8][64] -> [8][64]
+inv_mix_columns_1 = bitsliced (stateTransformation InvMixColumns1)
+
+InvMixColumns1 : AES128::State -> AES128::State
+InvMixColumns1 state =
+  AES128::InvShiftRows (AES128::InvMixColumns (AES128::ShiftRows state))
+
+inv_mix_columns_2 : [8][64] -> [8][64]
+inv_mix_columns_2 = bitsliced (stateTransformation InvMixColumns2)
+
+InvMixColumns2 : AES128::State -> AES128::State
+InvMixColumns2 state =
+  AES128::InvShiftRows
+    (AES128::InvShiftRows
+      (AES128::InvMixColumns
+        (AES128::InvShiftRows
+          (AES128::InvShiftRows state))))
+
+inv_mix_columns_3 : [8][64] -> [8][64]
+inv_mix_columns_3 = bitsliced (stateTransformation InvMixColumns3)
+
+InvMixColumns3 : AES128::State -> AES128::State
+InvMixColumns3 state =
+  AES128::ShiftRows (AES128::InvMixColumns (AES128::InvShiftRows state))
 
 shift_rows_1 : [8][64] -> [8][64]
 shift_rows_1 = bitsliced (stateTransformation AES128::ShiftRows)

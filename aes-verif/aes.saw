@@ -157,6 +157,16 @@ sub_bytes_key_ovs <-
             (sub_bytes_key_spec (eval_int rcon)) rme
     );
 
+let inv_sub_bytes_spec = do {
+    state_init <- mir_fresh_var "state_init" (mir_array 8 mir_u64);
+    state_ref <- mir_ref_of_mut (mir_term state_init);
+    mir_execute_func [mir_slice_value state_ref];
+    mir_points_to state_ref (mir_term {{ inv_sub_bytes state_init }});
+};
+
+inv_sub_bytes_ov <-
+    my_verify m "aes::soft::fixslice::inv_sub_bytes" [] false inv_sub_bytes_spec rme;
+
 let add_round_key_spec rk_off = do {
     state_init <- mir_fresh_var "state_init" (mir_array 8 mir_u64);
     state_ref <- mir_ref_of_mut (mir_term state_init);
@@ -202,6 +212,22 @@ mix_columns_3_ov <-
     my_verify m "aes::soft::fixslice::mix_columns_3" [] false
         (mix_columns_spec {{ mix_columns_3 }}) rme;
 
+inv_mix_columns_0_ov <-
+    my_verify m "aes::soft::fixslice::inv_mix_columns_0" [] false
+        (mix_columns_spec {{ inv_mix_columns_0 }}) rme;
+
+inv_mix_columns_1_ov <-
+    my_verify m "aes::soft::fixslice::inv_mix_columns_1" [] false
+        (mix_columns_spec {{ inv_mix_columns_1 }}) rme;
+
+inv_mix_columns_2_ov <-
+    my_verify m "aes::soft::fixslice::inv_mix_columns_2" [] false
+        (mix_columns_spec {{ inv_mix_columns_2 }}) rme;
+
+inv_mix_columns_3_ov <-
+    my_verify m "aes::soft::fixslice::inv_mix_columns_3" [] false
+        (mix_columns_spec {{ inv_mix_columns_3 }}) rme;
+
 let shift_rows_spec cry_fun = do {
     state_init <- mir_fresh_var "state_init" (mir_array 8 mir_u64);
     state_ref <- mir_ref_of_mut (mir_term state_init);
@@ -210,12 +236,6 @@ let shift_rows_spec cry_fun = do {
 };
 
 shift_rows_2_ov <- my_verify m "aes::soft::fixslice::shift_rows_2" [] false (shift_rows_spec {{ shift_rows_2 }}) rme;
-
-inv_shift_rows_1_ov <- my_verify m "aes::soft::fixslice::inv_shift_rows_1" [] false (shift_rows_spec {{ inv_shift_rows_1 }}) rme;
-
-inv_shift_rows_2_ov <- my_verify m "aes::soft::fixslice::inv_shift_rows_2" [] false (shift_rows_spec {{ inv_shift_rows_2 }}) rme;
-
-inv_shift_rows_3_ov <- my_verify m "aes::soft::fixslice::inv_shift_rows_3" [] false (shift_rows_spec {{ inv_shift_rows_3 }}) rme;
 
 let inv_shift_rows_key_spec cry_fun rcon = do {
     state_init <- mir_fresh_var "state_init" (mir_array 88 mir_u64);
@@ -263,13 +283,6 @@ aes128_key_schedule_ov <- my_verify m "aes::soft::fixslice::aes128_key_schedule"
     do {
         unint_z3 ["SBox"];
     };
-
-let encrypt128_spec = do {
-    key <- mir_fresh_var "key" (mir_array 16 mir_u8);
-    block <- mir_fresh_var "block" (mir_array 16 mir_u8);
-    mir_execute_func [mir_term key, mir_term block];
-    mir_return (mir_term {{ encrypt128 key block }});
-};
 
 thm_inv_bitslice_bitslice <- prove_print rme {{ \x -> inv_bitslice (bitslice x) == x }};
 
@@ -376,19 +389,6 @@ thm_stateTransformation_decomposition4 <- prove_print
                 (stateTransformation (\state -> AES128::SubBytes (AES128::ShiftRows (AES128::ShiftRows state))) blocks)
     }};
 
-thm_stateTransformation_SubBytesNots_decomposition <- prove_print
-    do {
-        simplify (addsimp thm_stateTransformation_composition empty_ss);
-        goal_exact (parse_core
-            "\\(f : Vec 4 (Vec 4 (Vec 8 Bool)) -> Vec 4 (Vec 4 (Vec 8 Bool))) (blocks : Vec 4 (Vec 16 (Vec 8 Bool))) -> vecEq_refl 4 (Vec 16 (Vec 8 Bool)) (vecEq 16 (Vec 8 Bool) (bvEq 8)) (vecEq_refl 16 (Vec 8 Bool) (bvEq 8) (bvEq_refl 8)) (stateTransformation (\\(x : Vec 4 (Vec 4 (Vec 8 Bool))) -> SubBytesNots (f x)) blocks)"
-        );
-    }
-    {{
-        \(f : AES128::State -> AES128::State) (blocks : [4][16][8]) ->
-            stateTransformation (\x -> SubBytesNots (f x)) blocks
-            == stateTransformation SubBytesNots (stateTransformation f blocks)
-    }};
-
 thm_foo <- prove_print
     do {
         unint_z3 ["keyExpansion"];
@@ -469,6 +469,13 @@ thm_ShiftRows_InvShiftRows <- prove_print z3 {{
 
 thm_InvShiftRows_ShiftRows <- prove_print z3 {{ AES128::shiftRowsInverts }};
 
+let encrypt128_spec = do {
+    key <- mir_fresh_var "key" (mir_array 16 mir_u8);
+    block <- mir_fresh_var "block" (mir_array 16 mir_u8);
+    mir_execute_func [mir_term key, mir_term block];
+    mir_return (mir_term {{ encrypt128 key block }});
+};
+
 mir_verify m "aes_verif::encrypt128"
     (concat
         add_round_key_ovs
@@ -510,4 +517,141 @@ mir_verify m "aes_verif::encrypt128"
         simplify (addsimps [thm_SubBytes_ShiftRows, thm_SubBytes_InvShiftRows, thm_ShiftRows_InvShiftRows, thm_InvShiftRows_ShiftRows] empty_ss);
 
         unint_z3 ["AddRoundKey", "SubBytes", "ShiftRows", "MixColumns"];
+
+        proof_subshell ();
+    };
+
+thms_SubBytesNots_InvMixColumnsN <-
+    for [{{AES128::InvMixColumns}}, {{InvMixColumns1}}, {{InvMixColumns2}}, {{InvMixColumns3}}] (\invMixColumns -> do {
+        prove_print z3 {{
+            \(state : AES128::State) ->
+                SubBytesNots (invMixColumns state) == invMixColumns (SubBytesNots state)
+        }};
+    });
+
+thms_bar0 <-
+    for [10, 8, 4] (\i -> do {
+        prove_print
+            do {
+                unint_z3 ["keyExpansion"];
+            }
+            {{
+                \(key : [16][8]) (blocks : [4][16][8]) ->
+                    addRoundKey' (inv_bitslice (take`{8} (drop`{i * 8} (aes128_key_schedule key)))) blocks
+                    == stateTransformation (\x -> SubBytesNots (AES128::AddRoundKey (AES128::keyExpansion (join key) @ `i) x)) blocks
+            }};
+    });
+
+thms_bar1 <-
+    for [9, 5, 1] (\i -> do {
+        prove_print
+            do {
+                unint_z3 ["keyExpansion"];
+            }
+            {{
+                \(key : [16][8]) (blocks : [4][16][8]) ->
+                    addRoundKey' (inv_bitslice (take`{8} (drop`{i * 8} (aes128_key_schedule key)))) blocks
+                    == stateTransformation (\x -> SubBytesNots (AES128::InvShiftRows (AES128::AddRoundKey (AES128::keyExpansion (join key) @ `i) (AES128::ShiftRows x)))) blocks
+            }};
+    });
+
+thms_bar2 <-
+    for [6, 2] (\i -> do {
+        prove_print
+            do {
+                unint_z3 ["keyExpansion"];
+            }
+            {{
+                \(key : [16][8]) (blocks : [4][16][8]) ->
+                    addRoundKey' (inv_bitslice (take`{8} (drop`{i * 8} (aes128_key_schedule key)))) blocks
+                    == stateTransformation (\x -> SubBytesNots (AES128::ShiftRows (AES128::ShiftRows (AES128::AddRoundKey (AES128::keyExpansion (join key) @ `i) (AES128::InvShiftRows (AES128::InvShiftRows x)))))) blocks
+            }};
+    });
+
+thms_bar3 <-
+    for [7, 3] (\i -> do {
+        prove_print
+            do {
+                unint_z3 ["keyExpansion"];
+            }
+            {{
+                \(key : [16][8]) (blocks : [4][16][8]) ->
+                    addRoundKey' (inv_bitslice (take`{8} (drop`{i * 8} (aes128_key_schedule key)))) blocks
+                    == stateTransformation (\x -> SubBytesNots (AES128::ShiftRows (AES128::AddRoundKey (AES128::keyExpansion (join key) @ `i) (AES128::InvShiftRows x)))) blocks
+            }};
+    });
+
+thm_SubBytesNots_SubBytesNots <-
+    prove_print z3 {{
+        \(state : AES128::State) ->
+            SubBytesNots (SubBytesNots state) == state
+    }};
+
+thm_ShiftRows_ShiftRows_ShiftRows <-
+    prove_print z3 {{
+        \(state : AES128::State) ->
+            AES128::ShiftRows (AES128::ShiftRows (AES128::ShiftRows state)) == AES128::InvShiftRows state
+    }};
+
+thm_InvShiftRows_InvSubBytes <-
+    prove_print z3 {{
+        \(state : AES128::State) ->
+            AES128::InvShiftRows (AES128::InvSubBytes state) == AES128::InvSubBytes (AES128::InvShiftRows state)
+    }};
+
+thm_ShiftRows_InvSubBytes <-
+    prove_print z3 {{
+        \(state : AES128::State) ->
+            AES128::ShiftRows (AES128::InvSubBytes state) == AES128::InvSubBytes (AES128::ShiftRows state)
+    }};
+
+let decrypt128_spec = do {
+    key <- mir_fresh_var "key" (mir_array 16 mir_u8);
+    block <- mir_fresh_var "block" (mir_array 16 mir_u8);
+    mir_execute_func [mir_term key, mir_term block];
+    mir_return (mir_term {{ decrypt128 key block }});
+};
+
+mir_verify m "aes_verif::decrypt128"
+    (concat
+        add_round_key_ovs
+        [
+            aes128_key_schedule_ov,
+            bitslice_encrypt_ov,
+            inv_bitslice_ov,
+            inv_sub_bytes_ov,
+            inv_mix_columns_0_ov,
+            inv_mix_columns_1_ov,
+            inv_mix_columns_2_ov,
+            inv_mix_columns_3_ov,
+            shift_rows_2_ov
+        ])
+    false decrypt128_spec
+    do {
+        simplify (add_prelude_eqs ["implies_True1"] empty_ss);
+
+        unfolding ["add_round_key", "inv_sub_bytes", "inv_mix_columns_0", "inv_mix_columns_1", "inv_mix_columns_2", "inv_mix_columns_3", "shift_rows_2", "bitsliced"];
+        beta_reduce_goal;
+
+        simplify
+            (addsimp thm_foo
+                (addsimps thms_bar0
+                    (addsimps thms_bar1
+                        (addsimps thms_bar2
+                            (addsimps thms_bar3 empty_ss)))));
+
+        simplify (addsimps [thm_inv_bitslice_bitslice, thm_stateTransformation_composition] empty_ss);
+
+        simplify (addsimps thms_SubBytesNots_InvMixColumnsN empty_ss);
+
+        simplify (addsimp thm_SubBytesNots_SubBytesNots empty_ss);
+
+        unfolding ["InvMixColumns1", "InvMixColumns2", "InvMixColumns3"];
+        beta_reduce_goal;
+
+        simplify (addsimps [thm_ShiftRows_InvShiftRows, thm_InvShiftRows_ShiftRows, thm_ShiftRows_ShiftRows_ShiftRows, thm_InvShiftRows_InvSubBytes, thm_ShiftRows_InvSubBytes] empty_ss);
+
+        unint_z3 ["AddRoundKey", "InvSubBytes", "InvShiftRows", "InvMixColumns"];
+
+        proof_subshell ();
     };

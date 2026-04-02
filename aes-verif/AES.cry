@@ -4,3 +4,6 @@ import Primitive::Symmetric::Cipher::Block::AES::Instantiations::AES128 as AES12
 
 encrypt128 : [16][8] -> [16][8] -> [16][8]
 encrypt128 key block = split (AES128::encrypt (join key) (join block))
+
+decrypt128 : [16][8] -> [16][8] -> [16][8]
+decrypt128 key block = split (AES128::decrypt (join key) (join block))
