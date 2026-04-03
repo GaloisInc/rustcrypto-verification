@@ -1,0 +1,11 @@
+[package]
+name = "sha2-verif"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sha2 = { git = "https://github.com/RyanGlScott/hashes.git", package = "sha2", branch = "crucible-mir-patches", features = ["force-soft"] }
+
+[patch.crates-io]
+block-buffer = { git = "https://github.com/RyanGlScott/utils.git", package = "block-buffer", branch = "crucible-mir-patches" }
+generic-array = { git = "https://github.com/RyanGlScott/generic-array.git", branch = "backport-hybrid-arrays-to-generic-array-0.14.7" }
