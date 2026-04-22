@@ -1,0 +1,18 @@
+module AesVerif::KeySchedule192 where
+
+import AesVerif::Bitslice
+import AesVerif::Aes192
+import submodule Spec as Spec
+
+key_schedule : KeyBytes -> FSRoundKeys
+key_schedule key =
+  join [ w0, sub_bytes_nots (inv_shift_rows_1 w1), sub_bytes_nots (inv_shift_rows_2 w2), sub_bytes_nots (inv_shift_rows_3 w3)
+       , sub_bytes_nots w4, sub_bytes_nots (inv_shift_rows_1 w5), sub_bytes_nots (inv_shift_rows_2 w6), sub_bytes_nots (inv_shift_rows_3 w7)
+       , sub_bytes_nots w8, sub_bytes_nots (inv_shift_rows_1 w9), sub_bytes_nots (inv_shift_rows_2 w10), sub_bytes_nots (inv_shift_rows_3 w11)
+       , sub_bytes_nots w12
+       ]
+  where
+    [w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12] =
+      [ bitslice (repeat (join (transpose rk)))
+      | rk <- Spec::keyExpansion (join key)
+      ]

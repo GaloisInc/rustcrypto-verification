@@ -1,0 +1,2 @@
+module AesVerif::Aes192 = AesVerif::Parameterized where
+  type KeySize = 192

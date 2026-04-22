@@ -1,0 +1,2 @@
+module AesVerif::Aes256 = AesVerif::Parameterized where
+  type KeySize = 256

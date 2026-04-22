@@ -1,0 +1,256 @@
+/**
+Cryptol specifications for the functions in `aes::soft::fixslice` on 64-bit
+platforms (`aes/src/soft/fixslice64.rs`). They are mostly defined in terms of
+definitions from `cryptol-specs`, so that SAW can prove equivalence between the
+Rust code and `cryptol-specs`.
+
+Naming conventions: Specifications for Rust functions are named exactly the same
+as the Rust function (`lower_snake_case`). Functions that operate on `State` as
+defined in `cryptol-specs` are in `UpperCamelCase`, like the ones in
+`cryptol-specs` itself (which in turn are named identically to the functions in
+the official AES spec). Other auxiliary functions are mostly `lowerCamelCase`
+like normal Cryptol functions.
+*/
+module AesVerif::Parameterized where
+
+import AesVerif::Bitslice
+
+parameter
+  type KeySize : #
+  type constraint (fin KeySize, KeySize % 64 == 0, KeySize / 64 >= 2, KeySize / 64 <= 4)
+
+submodule Spec = Primitive::Symmetric::Cipher::Block::AES::Specification where
+  type KeySize' = KeySize
+
+/** An AES key as a byte array. */
+type KeyBytes = [Spec::Nk * 4][8]
+
+type FSRoundKeys = [(Spec::Nr + 1) * 8][64]
+
+/**
+Given a function that operates on `Spec::State` as defined in `cryptol-specs`,
+return a version of it that operates on non-bitsliced batch state as defined in
+the `aes` crate.
+
+Note that the `cryptol-specs` state matrix is in row-major order, while the
+`aes` crate uses column-major order, so we need to transpose.
+*/
+stateTransformation : (Spec::State -> Spec::State)
+                   -> BatchBlockBytes -> BatchBlockBytes
+stateTransformation f blocks =
+  [join (transpose (f (transpose (split block)))) | block <- blocks]
+
+/**
+`stateTransformation` for functions with two arguments.
+*/
+stateTransformation2 : (Spec::State -> Spec::State -> Spec::State)
+                    -> BatchBlockBytes -> BatchBlockBytes -> BatchBlockBytes
+stateTransformation2 f blocks1 blocks2 =
+  [ join (transpose (f (transpose (split block1)) (transpose (split block2))))
+  | block1 <- blocks1
+  | block2 <- blocks2
+  ]
+
+/**
+Specification for the `fixslice::add_round_key` function.
+*/
+add_round_key : FSState -> FSState -> FSState
+add_round_key fsState roundKey = bitsliced (addRoundKey' roundKey) fsState
+
+/**
+A version of `Spec::AddRoundKey` that takes a **bitsliced round key**
+(technically a batch of 4 round keys for a single round) and adds it to
+**non-bitsliced batch state** as defined in the `aes` crate.
+*/
+addRoundKey' : FSState -> BatchBlockBytes -> BatchBlockBytes
+addRoundKey' roundKey =
+  stateTransformation2 Spec::AddRoundKey (inv_bitslice roundKey)
+
+/**
+Add the constant term in the S-box. This is inlined into the `cryptol-specs`
+definition of `sboxTable` so we define our own here. It shouldn't matter that
+this is separate from `Spec::SBox`, because the `SubBytesNots`s should cancel
+out in the end.
+*/
+SubBytesNots : Spec::State -> Spec::State
+SubBytesNots state = [[b ^ 0x63 | b <- row] | row <- state]
+
+/**
+Specification for the `fixslice::sub_bytes_nots` function. This is only used in
+the key schedule functions, so we define it directly on the fixsliced format (as
+opposed to in terms of `SubBytesNots`) to make it easier for the solver.
+*/
+sub_bytes_nots : FSState -> FSState
+sub_bytes_nots [s0, s1, s2, s3, s4, s5, s6, s7] =
+  [~s0, ~s1, s2, s3, s4, ~s5, ~s6, s7]
+
+/**
+Specification for the `fixslice::sub_bytes` function. Compared to
+`Spec::SubBytes`, it has an extra `SubBytesNots`.
+*/
+sub_bytes : FSState -> FSState
+sub_bytes =
+  bitsliced
+    (stateTransformation
+      (\state -> SubBytesNots (Spec::SubBytes state)))
+
+/**
+Specification for the `fixslice::inv_sub_bytes` function. Compared to
+`Spec::InvSubBytes`, it has an extra `SubBytesNots`.
+*/
+inv_sub_bytes : FSState -> FSState
+inv_sub_bytes =
+  bitsliced
+    (stateTransformation
+      (\state -> Spec::InvSubBytes (SubBytesNots state)))
+
+/**
+Specification for the `fixslice::mix_columns_0` function.
+*/
+mix_columns_0 : FSState -> FSState
+mix_columns_0 = bitsliced (stateTransformation Spec::MixColumns)
+
+/**
+Specification for the `fixslice::mix_columns_1` function.
+*/
+mix_columns_1 : FSState -> FSState
+mix_columns_1 = bitsliced (stateTransformation MixColumns1)
+
+/**
+The behavior of `mix_columns_1` on a single `Spec::State` as defined in
+`cryptol-specs`.
+*/
+MixColumns1 : Spec::State -> Spec::State
+MixColumns1 state =
+  Spec::InvShiftRows (Spec::MixColumns (Spec::ShiftRows state))
+
+/**
+Specification for the `fixslice::mix_columns_2` function.
+*/
+mix_columns_2 : FSState -> FSState
+mix_columns_2 = bitsliced (stateTransformation MixColumns2)
+
+/**
+The behavior of `mix_columns_2` on a single `Spec::State` as defined in
+`cryptol-specs`. (Note that `ShiftRows` twice is the same as `InvShiftRows`
+twice.)
+*/
+MixColumns2 : Spec::State -> Spec::State
+MixColumns2 state =
+  Spec::ShiftRows
+    (Spec::ShiftRows
+      (Spec::MixColumns
+        (Spec::ShiftRows
+          (Spec::ShiftRows state))))
+
+/**
+Specification for the `fixslice::mix_columns_3` function.
+*/
+mix_columns_3 : FSState -> FSState
+mix_columns_3 = bitsliced (stateTransformation MixColumns3)
+
+/**
+The behavior of `mix_columns_3` on a single `Spec::State` as defined in
+`cryptol-specs`.
+*/
+MixColumns3 : Spec::State -> Spec::State
+MixColumns3 state =
+  Spec::ShiftRows (Spec::MixColumns (Spec::InvShiftRows state))
+
+/**
+Specification for the `fixslice::inv_mix_columns_0` function.
+*/
+inv_mix_columns_0 : FSState -> FSState
+inv_mix_columns_0 = bitsliced (stateTransformation Spec::InvMixColumns)
+
+/**
+Specification for the `fixslice::inv_mix_columns_1` function.
+*/
+inv_mix_columns_1 : FSState -> FSState
+inv_mix_columns_1 = bitsliced (stateTransformation InvMixColumns1)
+
+/**
+The behavior of `inv_mix_columns_1` on a single `Spec::State` as defined in
+`cryptol-specs`.
+*/
+InvMixColumns1 : Spec::State -> Spec::State
+InvMixColumns1 state =
+  Spec::InvShiftRows (Spec::InvMixColumns (Spec::ShiftRows state))
+
+/**
+Specification for the `fixslice::inv_mix_columns_2` function.
+*/
+inv_mix_columns_2 : FSState -> FSState
+inv_mix_columns_2 = bitsliced (stateTransformation InvMixColumns2)
+
+/**
+The behavior of `inv_mix_columns_2` on a single `Spec::State` as defined in
+`cryptol-specs`. (Note that `InvShiftRows` twice is the same as `ShiftRows`
+twice.)
+*/
+InvMixColumns2 : Spec::State -> Spec::State
+InvMixColumns2 state =
+  Spec::InvShiftRows
+    (Spec::InvShiftRows
+      (Spec::InvMixColumns
+        (Spec::InvShiftRows
+          (Spec::InvShiftRows state))))
+
+/**
+Specification for the `fixslice::inv_mix_columns_3` function.
+*/
+inv_mix_columns_3 : FSState -> FSState
+inv_mix_columns_3 = bitsliced (stateTransformation InvMixColumns3)
+
+/**
+The behavior of `inv_mix_columns_3` on a single `Spec::State` as defined in
+`cryptol-specs`.
+*/
+InvMixColumns3 : Spec::State -> Spec::State
+InvMixColumns3 state =
+  Spec::ShiftRows (Spec::InvMixColumns (Spec::InvShiftRows state))
+
+/**
+Specification for the `fixslice::shift_rows_1` function.
+*/
+shift_rows_1 : FSState -> FSState
+shift_rows_1 = bitsliced (stateTransformation Spec::ShiftRows)
+
+/**
+Specification for the `fixslice::shift_rows_2` function.
+*/
+shift_rows_2 : FSState -> FSState
+shift_rows_2 =
+  bitsliced
+    (stateTransformation
+      (\state -> Spec::ShiftRows (Spec::ShiftRows state)))
+
+/**
+Specification for the `fixslice::shift_rows_3` function.
+*/
+shift_rows_3 : FSState -> FSState
+shift_rows_3 = bitsliced (stateTransformation Spec::InvShiftRows)
+
+/**
+Specification for the `fixslice::inv_shift_rows_1` function.
+*/
+inv_shift_rows_1 : FSState -> FSState
+inv_shift_rows_1 = shift_rows_3
+
+/**
+Specification for the `fixslice::inv_shift_rows_2` function.
+*/
+inv_shift_rows_2 : FSState -> FSState
+inv_shift_rows_2 = shift_rows_2
+
+/**
+Specification for the `fixslice::inv_shift_rows_3` function.
+*/
+inv_shift_rows_3 : FSState -> FSState
+inv_shift_rows_3 = shift_rows_1
+
+encrypt : KeyBytes -> BlockBytes -> BlockBytes
+encrypt key block = split (Spec::encrypt (join key) (join block))
+
+decrypt : KeyBytes -> BlockBytes -> BlockBytes
+decrypt key block = split (Spec::decrypt (join key) (join block))

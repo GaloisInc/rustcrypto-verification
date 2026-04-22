@@ -1,0 +1,99 @@
+module AesVerif::Bitslice where
+
+/** A single AES block, as a byte array. Corresponds to `aes::Block`. */
+type BlockBytes = [16][8]
+
+/** An array of 4 blocks. Corresponds to `fixslice::BatchBlocks` */
+type BatchBlockBytes = [4]BlockBytes
+
+/** Fixsliced form of 4 AES blocks. Corresponds to `fixslice::State` */
+type FSState = [8][64]
+
+/**
+A direct translation into Cryptol of the comment in `fixslice::bitslice`
+describing what the function does. But note that Cryptol orders bits starting
+with the most significant bit first, while `fixslice64.rs` orders them least
+significant bit first. Usually this doesn't matter, but with bitslicing, the bit
+order turns into the byte order. So the Rust code has to reorder the bits, while
+Cryptol doesn't. Therefore this Cryptol function doesn't correspond exactly to
+what the `fixslice::bitslice` function does.
+*/
+bitslice_msbFirst : BatchBlockBytes -> FSState
+bitslice_msbFirst bb_ccrr_ppp = ppp_rrccbb
+  where
+  ccrr_bb_ppp : [16][4][8]
+  ccrr_bb_ppp = transpose bb_ccrr_ppp
+  ccrrbb_ppp : [64][8]
+  ccrrbb_ppp = join ccrr_bb_ppp
+  ppp_ccrrbb : [8][64]
+  ppp_ccrrbb = transpose ccrrbb_ppp
+  ppp_cc_rr_bb : [8][4][4][4]
+  ppp_cc_rr_bb = [split (split ccrrbb) | ccrrbb <- ppp_ccrrbb]
+  ppp_rr_cc_bb : [8][4][4][4]
+  ppp_rr_cc_bb = map transpose ppp_cc_rr_bb
+  ppp_rrccbb : [8][64]
+  ppp_rrccbb = [join (join rr_cc_bb) | rr_cc_bb <- ppp_rr_cc_bb]
+
+/**
+Making sure `bitslice_msbFirst` satisfies the description in the comment in
+`fixslice::bitslice`.
+*/
+bitslice_correct : BatchBlockBytes -> [2] -> [2] -> [2] -> [3] -> Bit
+property bitslice_correct input block row col bit =
+  input @ block @ (col # row) @ bit == output @ bit @ (row # col # block)
+  where
+  output = bitslice_msbFirst input
+
+/**
+Specification for the `fixslice::bitslice` function. Due to the difference in
+bit ordering, we need to reverse the input bits and the output bits of the
+MSB-first version, so that they are LSB-first like in Rust.
+*/
+bitslice : BatchBlockBytes -> FSState
+bitslice input = map reverse (bitslice_msbFirst (map (map reverse) input))
+
+/**
+A direct translation into Cryptol of the comment in `fixslice::inv_bitslice`
+describing what the function does. This does not correspond exactly to the
+behavior of the `fixslice::inv_bitslice` function; see `bitslice_msbFirst` for
+why.
+*/
+inv_bitslice_msbFirst : FSState -> BatchBlockBytes
+inv_bitslice_msbFirst ppp_rrccbb = bb_ccrr_ppp
+  where
+  ppp_rr_cc_bb : [8][4][4][4]
+  ppp_rr_cc_bb = [split (split rrccbb) | rrccbb <- ppp_rrccbb]
+  ppp_cc_rr_bb : [8][4][4][4]
+  ppp_cc_rr_bb = map transpose ppp_rr_cc_bb
+  ppp_ccrrbb : [8][64]
+  ppp_ccrrbb = [join (join cc_rr_bb) | cc_rr_bb <- ppp_cc_rr_bb]
+  ccrrbb_ppp : [64][8]
+  ccrrbb_ppp = transpose ppp_ccrrbb
+  ccrr_bb_ppp : [16][4][8]
+  ccrr_bb_ppp = split ccrrbb_ppp
+  bb_ccrr_ppp : [4][16][8]
+  bb_ccrr_ppp = transpose ccrr_bb_ppp
+
+/**
+Making sure `inv_bitslice_msbFirst` is the (left) inverse of
+`bitslice_msbFirst`.
+*/
+inv_bitslice_correct : BatchBlockBytes -> Bit
+property inv_bitslice_correct input =
+  inv_bitslice_msbFirst (bitslice_msbFirst input) == input
+
+/**
+Specification for the `fixslice::inv_bitslice` function. Due to the difference
+in bit ordering, we need to reverse the input bits and the output bits of the
+MSB-first version, so that they are LSB-first like in Rust.
+*/
+inv_bitslice : FSState -> BatchBlockBytes
+inv_bitslice input =
+  map (map reverse) (inv_bitslice_msbFirst (map reverse input))
+
+/**
+Given a function that operates on non-bitsliced batch state, return a version of
+it that operates on bitsliced state.
+*/
+bitsliced : (BatchBlockBytes -> BatchBlockBytes) -> FSState -> FSState
+bitsliced f x = bitslice (f (inv_bitslice x))
