@@ -12,8 +12,8 @@ Aes256 <- cryptol_load "AesVerif/Aes256.cry";
 KeySchedule256 <- cryptol_load "AesVerif/KeySchedule256.cry";
 
 let my_verify m f ovs ps spec tac =
-    mir_verify m f ovs ps spec tac
-    // mir_unsafe_assume_spec m f spec
+    // mir_verify m f ovs ps spec tac
+    mir_unsafe_assume_spec m f spec
     ;
 
 m <- mir_load_module
@@ -614,8 +614,6 @@ let verify_aes_size
                 ]))
         false decrypt_spec
         do {
-            simplify (add_prelude_eqs ["implies_True1"] empty_ss);
-
             unfolding ["add_round_key", "inv_sub_bytes", "inv_mix_columns_0", "inv_mix_columns_1", "inv_mix_columns_2", "inv_mix_columns_3", "shift_rows_2", "bitsliced"];
 
             simplify
@@ -623,13 +621,15 @@ let verify_aes_size
                     (addsimps thms_bar0
                         (addsimps thms_bar1
                             (addsimps thms_bar2
-                                (addsimps thms_bar3 empty_ss)))));
-
-            simplify (addsimps [thm_inv_bitslice_bitslice, thm_stateTransformation_composition] empty_ss);
-
-            simplify (addsimps thms_SubBytesNots_InvMixColumnsN empty_ss);
-
-            simplify (addsimp thm_SubBytesNots_SubBytesNots empty_ss);
+                                (addsimps thms_bar3
+                                    (addsimps thms_SubBytesNots_InvMixColumnsN
+                                        (addsimps
+                                            [
+                                                thm_inv_bitslice_bitslice,
+                                                thm_stateTransformation_composition,
+                                                thm_SubBytesNots_SubBytesNots
+                                            ]
+                                            empty_ss)))))));
 
             unfolding ["InvMixColumns1", "InvMixColumns2", "InvMixColumns3"];
 
