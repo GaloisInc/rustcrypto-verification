@@ -1,6 +1,7 @@
 enable_experimental;
 
 import "AesVerif/Bitslice.cry";
+import "AesVerif/ProofUtils.cry";
 
 Aes128 <- cryptol_load "AesVerif/Aes128.cry";
 KeySchedule128 <- cryptol_load "AesVerif/KeySchedule128.cry";
@@ -160,9 +161,7 @@ let verify_aes_size
                 (eval_size {| (rcon + 1) * 8 |})
         ];
         mir_points_to rkeys_ref (mir_term {{
-            take`{rcon * 8} rkeys_init
-            # cry_fun (take`{8} (drop`{rcon * 8} rkeys_init))
-            # drop`{(rcon + 1) * 8} rkeys_init
+            modifyRound`{rcon} cry_fun rkeys_init
         }});
     };
 
@@ -225,7 +224,7 @@ let verify_aes_size
                 (eval_size {| (rk_off + 1) * 8 |})
         ];
         mir_points_to state_ref (mir_term {{
-            Aes::add_round_key state_init (take`{8} (drop`{rk_off * 8} rkeys))
+            Aes::add_round_key state_init (sliceRound`{rk_off} rkeys)
         }});
     };
 
@@ -354,7 +353,7 @@ let verify_aes_size
         }
         {{
             \(key : Aes::KeyBytes) (blocks : BatchBlockBytes) ->
-                Aes::addRoundKey' (take`{8} (drop`{0} (KeySchedule::key_schedule key))) blocks
+                Aes::addRoundKey' (sliceRound`{0} (KeySchedule::key_schedule key)) blocks
                 == Aes::stateTransformation (Aes::Spec::AddRoundKey (Aes::Spec::keyExpansion (join key) @ 0)) blocks
         }};
 
@@ -367,7 +366,7 @@ let verify_aes_size
                 }
                 {{
                     \(key : Aes::KeyBytes) (blocks : BatchBlockBytes) ->
-                        Aes::addRoundKey' (take`{8} (drop`{i * 8} (KeySchedule::key_schedule key)))
+                        Aes::addRoundKey' (sliceRound`{i} (KeySchedule::key_schedule key))
                             (Aes::stateTransformation Aes::SubBytesNots blocks)
                         == Aes::stateTransformation (Aes::Spec::AddRoundKey (Aes::Spec::keyExpansion (join key) @ `i)) blocks
                 }};
@@ -382,7 +381,7 @@ let verify_aes_size
                 }
                 {{
                     \(key : Aes::KeyBytes) (blocks : BatchBlockBytes) ->
-                        Aes::addRoundKey' (take`{8} (drop`{i * 8} (KeySchedule::key_schedule key)))
+                        Aes::addRoundKey' (sliceRound`{i} (KeySchedule::key_schedule key))
                             (Aes::stateTransformation (\x -> Aes::SubBytesNots (Aes::Spec::InvShiftRows x)) blocks)
                         == Aes::stateTransformation (\x -> Aes::Spec::InvShiftRows (Aes::Spec::AddRoundKey (Aes::Spec::keyExpansion (join key) @ `i) x)) blocks
                 }};
@@ -397,7 +396,7 @@ let verify_aes_size
                 }
                 {{
                     \(key : Aes::KeyBytes) (blocks : BatchBlockBytes) ->
-                        Aes::addRoundKey' (take`{8} (drop`{i * 8} (KeySchedule::key_schedule key)))
+                        Aes::addRoundKey' (sliceRound`{i} (KeySchedule::key_schedule key))
                             (Aes::stateTransformation (\x -> Aes::SubBytesNots (Aes::Spec::ShiftRows (Aes::Spec::ShiftRows x))) blocks)
                         == Aes::stateTransformation (\x -> Aes::Spec::ShiftRows (Aes::Spec::ShiftRows (Aes::Spec::AddRoundKey (Aes::Spec::keyExpansion (join key) @ `i) x))) blocks
                 }};
@@ -412,7 +411,7 @@ let verify_aes_size
                 }
                 {{
                     \(key : Aes::KeyBytes) (blocks : BatchBlockBytes) ->
-                        Aes::addRoundKey' (take`{8} (drop`{i * 8} (KeySchedule::key_schedule key)))
+                        Aes::addRoundKey' (sliceRound`{i} (KeySchedule::key_schedule key))
                             (Aes::stateTransformation (\x -> Aes::SubBytesNots (Aes::Spec::ShiftRows x)) blocks)
                         == Aes::stateTransformation (\x -> Aes::Spec::ShiftRows (Aes::Spec::AddRoundKey (Aes::Spec::keyExpansion (join key) @ `i) x)) blocks
                 }};
@@ -527,7 +526,7 @@ let verify_aes_size
                 }
                 {{
                     \(key : Aes::KeyBytes) (blocks : BatchBlockBytes) ->
-                        Aes::addRoundKey' (take`{8} (drop`{i * 8} (KeySchedule::key_schedule key))) blocks
+                        Aes::addRoundKey' (sliceRound`{i} (KeySchedule::key_schedule key)) blocks
                         == Aes::stateTransformation (\x -> Aes::SubBytesNots (Aes::Spec::AddRoundKey (Aes::Spec::keyExpansion (join key) @ `i) x)) blocks
                 }};
         });
@@ -540,7 +539,7 @@ let verify_aes_size
                 }
                 {{
                     \(key : Aes::KeyBytes) (blocks : BatchBlockBytes) ->
-                        Aes::addRoundKey' (take`{8} (drop`{i * 8} (KeySchedule::key_schedule key))) blocks
+                        Aes::addRoundKey' (sliceRound`{i} (KeySchedule::key_schedule key)) blocks
                         == Aes::stateTransformation (\x -> Aes::SubBytesNots (Aes::Spec::InvShiftRows (Aes::Spec::AddRoundKey (Aes::Spec::keyExpansion (join key) @ `i) (Aes::Spec::ShiftRows x)))) blocks
                 }};
         });
@@ -553,7 +552,7 @@ let verify_aes_size
                 }
                 {{
                     \(key : Aes::KeyBytes) (blocks : BatchBlockBytes) ->
-                        Aes::addRoundKey' (take`{8} (drop`{i * 8} (KeySchedule::key_schedule key))) blocks
+                        Aes::addRoundKey' (sliceRound`{i} (KeySchedule::key_schedule key)) blocks
                         == Aes::stateTransformation (\x -> Aes::SubBytesNots (Aes::Spec::ShiftRows (Aes::Spec::ShiftRows (Aes::Spec::AddRoundKey (Aes::Spec::keyExpansion (join key) @ `i) (Aes::Spec::InvShiftRows (Aes::Spec::InvShiftRows x)))))) blocks
                 }};
         });
@@ -566,7 +565,7 @@ let verify_aes_size
                 }
                 {{
                     \(key : Aes::KeyBytes) (blocks : BatchBlockBytes) ->
-                        Aes::addRoundKey' (take`{8} (drop`{i * 8} (KeySchedule::key_schedule key))) blocks
+                        Aes::addRoundKey' (sliceRound`{i} (KeySchedule::key_schedule key)) blocks
                         == Aes::stateTransformation (\x -> Aes::SubBytesNots (Aes::Spec::ShiftRows (Aes::Spec::AddRoundKey (Aes::Spec::keyExpansion (join key) @ `i) (Aes::Spec::InvShiftRows x)))) blocks
                 }};
         });

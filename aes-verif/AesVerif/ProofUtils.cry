@@ -1,0 +1,11 @@
+module AesVerif::ProofUtils where
+
+import AesVerif::Bitslice
+
+sliceRound : {i, n} (fin i, i < n) => [n * 8][64] -> FSState
+sliceRound xs = take (drop`{i * 8} xs)
+
+modifyRound : {i, n} (fin i, i < n) =>
+  (FSState -> FSState) -> [n * 8][64] -> [n * 8][64]
+modifyRound f xs =
+  take`{i * 8} xs # f (sliceRound`{i} xs) # drop`{(i + 1) * 8} xs
