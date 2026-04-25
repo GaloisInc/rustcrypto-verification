@@ -1,12 +1,23 @@
+/**
+Cryptol specifications for the bitslicing functions in `aes::soft::fixslice` on
+64-bit platforms (`aes/src/soft/fixslice64.rs`), which are independent of the
+key size and do not depend on the AES spec from `cryptol-specs`.
+*/
 module AesVerif::Bitslice where
 
-/** A single AES block, as a byte array. Corresponds to `aes::Block`. */
+/**
+A single AES block, as a byte array. Corresponds to `aes::Block`.
+*/
 type BlockBytes = [16][8]
 
-/** An array of 4 blocks. Corresponds to `fixslice::BatchBlocks` */
+/**
+An array of 4 blocks. Corresponds to `fixslice::BatchBlocks`.
+*/
 type BatchBlockBytes = [4]BlockBytes
 
-/** Fixsliced form of 4 AES blocks. Corresponds to `fixslice::State` */
+/**
+Fixsliced form of 4 AES blocks. Corresponds to `fixslice::State`.
+*/
 type FSState = [8][64]
 
 /**

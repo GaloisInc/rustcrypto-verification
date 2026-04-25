@@ -1,8 +1,20 @@
 /**
 Cryptol specifications for the functions in `aes::soft::fixslice` on 64-bit
-platforms (`aes/src/soft/fixslice64.rs`). They are mostly defined in terms of
-definitions from `cryptol-specs`, so that SAW can prove equivalence between the
-Rust code and `cryptol-specs`.
+platforms (`aes/src/soft/fixslice64.rs`), and in this `aes_verif` library, which
+depend on definitions from the AES spec in `cryptol-specs`. The specifications
+for the Rust functions are mostly defined in terms of the `cryptol-specs`
+definitions, so that SAW can prove equivalence between the Rust code and
+`cryptol-specs`.
+
+This module is parameterized by the key size, and can be instantiated with a key
+size of 128, 192, or 256, just like the `cryptol-specs` AES specification
+module.
+
+The specifications for the key schedule functions *could* be written in a
+generic way in this module parameterized by key size, but unfortunately it
+becomes too hard for SMT solvers to handle without extra help in the SAW proof.
+So instead they are defined separately for each key size, in
+`AesVerif::KeySchedule{128,192,256}`, in a more unrolled fashion.
 
 Naming conventions: Specifications for Rust functions are named exactly the same
 as the Rust function (`lower_snake_case`). Functions that operate on `State` as
@@ -15,16 +27,44 @@ module AesVerif::Parameterized where
 
 import AesVerif::Bitslice
 
+// This module takes the same parameter as the `cryptol-specs` spec, with the
+// same constraints, but since the `cryptol-specs` spec uses an anonymous
+// `parameter` block instead of a named interface module, we cannot reuse the
+// parameter definition and need to redefine it here.
 parameter
   type KeySize : #
-  type constraint (fin KeySize, KeySize % 64 == 0, KeySize / 64 >= 2, KeySize / 64 <= 4)
+  type constraint ( fin KeySize
+                  , KeySize % 64 == 0
+                  , KeySize / 64 >= 2
+                  , KeySize / 64 <= 4
+                  )
 
+/**
+The `cryptol-specs` AES specification, with the key size module parameter passed
+through to it.
+
+We use a submodule declaration rather than an `import as` so that the `Spec`
+module is visible externally and can be referenced in the SAW script.
+`cryptol-specs` offers its own instantiations of the spec under
+`Primitive::Symmetric::Cipher::Block::AES::Instantiations`, but because Cryptol
+functors are generative instead of applicative, they are treated as completely
+different modules than this `Spec` module. So since the definitions in this file
+use this `Spec` instantiation instead of the instantiations from
+`cryptol-specs`, the SAW proofs need to use this `Spec` as well.
+*/
 submodule Spec = Primitive::Symmetric::Cipher::Block::AES::Specification where
   type KeySize' = KeySize
 
-/** An AES key as a byte array. */
+/**
+An AES key as a byte array.
+*/
 type KeyBytes = [Spec::Nk * 4][8]
 
+/**
+Fixsliced form of all the AES round keys. Corresponds to
+`fixslice::FixsliceKeys{128,192,256}`. Note that each round key is duplicated 4
+times, because the fixslicing format covers 4 blocks at once.
+*/
 type FSRoundKeys = [(Spec::Nr + 1) * 8][64]
 
 /**
@@ -78,7 +118,9 @@ SubBytesNots state = [[b ^ 0x63 | b <- row] | row <- state]
 /**
 Specification for the `fixslice::sub_bytes_nots` function. This is only used in
 the key schedule functions, so we define it directly on the fixsliced format (as
-opposed to in terms of `SubBytesNots`) to make it easier for the solver.
+opposed to in terms of `SubBytesNots`) to make it easier for the solver. The
+equivalence to `SubBytesNots` is proven later, using SAW rewrite theorems
+instead of compositional overrides.
 */
 sub_bytes_nots : FSState -> FSState
 sub_bytes_nots [s0, s1, s2, s3, s4, s5, s6, s7] =
@@ -249,8 +291,16 @@ Specification for the `fixslice::inv_shift_rows_3` function.
 inv_shift_rows_3 : FSState -> FSState
 inv_shift_rows_3 = shift_rows_1
 
+/**
+Specification for the `aes_verif::encrypt{128,192,256}` function corresponding
+to the key size.
+*/
 encrypt : KeyBytes -> BlockBytes -> BlockBytes
 encrypt key block = split (Spec::encrypt (join key) (join block))
 
+/**
+Specification for the `aes_verif::decrypt{128,192,256}` function corresponding
+to the key size.
+*/
 decrypt : KeyBytes -> BlockBytes -> BlockBytes
 decrypt key block = split (Spec::decrypt (join key) (join block))

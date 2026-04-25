@@ -1,15 +1,29 @@
+/**
+Specification for the AES-128 key schedule function from `aes::soft::bitslice`
+on 64-bit platforms (`aes/soft/fixslice64.rs`).
+*/
 module AesVerif::KeySchedule128 where
 
 import AesVerif::Bitslice
 import AesVerif::Aes128
 import submodule Spec as Spec
 
+/**
+Specification for the `fixslice::aes128_key_schedule` function.
+*/
 key_schedule : KeyBytes -> FSRoundKeys
 key_schedule key =
-  join [ w0, sub_bytes_nots (inv_shift_rows_1 w1), sub_bytes_nots (inv_shift_rows_2 w2), sub_bytes_nots (inv_shift_rows_3 w3)
-       , sub_bytes_nots w4, sub_bytes_nots (inv_shift_rows_1 w5), sub_bytes_nots (inv_shift_rows_2 w6), sub_bytes_nots (inv_shift_rows_3 w7)
-       , sub_bytes_nots w8, sub_bytes_nots (inv_shift_rows_1 w9)
-       , sub_bytes_nots w10
+  join [                                  w0
+       , sub_bytes_nots (inv_shift_rows_1 w1 )
+       , sub_bytes_nots (inv_shift_rows_2 w2 )
+       , sub_bytes_nots (inv_shift_rows_3 w3 )
+       , sub_bytes_nots                   w4
+       , sub_bytes_nots (inv_shift_rows_1 w5 )
+       , sub_bytes_nots (inv_shift_rows_2 w6 )
+       , sub_bytes_nots (inv_shift_rows_3 w7 )
+       , sub_bytes_nots                   w8
+       , sub_bytes_nots (inv_shift_rows_1 w9 )
+       , sub_bytes_nots                   w10
        ]
   where
     [w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10] =

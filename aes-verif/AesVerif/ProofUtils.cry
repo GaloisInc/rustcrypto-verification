@@ -1,11 +1,24 @@
+/**
+Cryptol functions which are not used in the specs themselves but are used in the
+SAW script to simplify the proofs.
+*/
 module AesVerif::ProofUtils where
 
 import AesVerif::Bitslice
 
+/**
+Given a series of round keys in bitsliced format, get the round key for round
+`i` (starting from 0).
+*/
 sliceRound : {i, n} (fin i, i < n) => [n * 8][64] -> FSState
 sliceRound xs = take (drop`{i * 8} xs)
 
-modifyRound : {i, n} (fin i, i < n) =>
-  (FSState -> FSState) -> [n * 8][64] -> [n * 8][64]
-modifyRound f xs =
-  take`{i * 8} xs # f (sliceRound`{i} xs) # drop`{(i + 1) * 8} xs
+/**
+Given a series of round keys in bitsliced format, modify the round key for round
+`i` (starting from 0) using the given function.
+*/
+modifyRound : {i, n} (fin i, i < n)
+           => (FSState -> FSState) -> [n * 8][64] -> [n * 8][64]
+modifyRound f xs = take`{i * 8} xs
+                 # f (sliceRound`{i} xs)
+                 # drop`{(i + 1) * 8} xs

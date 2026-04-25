@@ -1,2 +1,5 @@
+/**
+Instantiation of `AesVerif::Parameterized` with a key size of 192.
+*/
 module AesVerif::Aes192 = AesVerif::Parameterized where
   type KeySize = 192
