@@ -1,6 +1,7 @@
 import "../cryptol-specs/Primitive/Keyless/Hash/SHA2Internal/SHA384.cry" as SHA384;
+import "Sha2Verif/Sha512.cry" as Sha512;
 
-m <- mir_load_module "sha2_verif.linked-mir.json";
+m <- mir_load_module "target/aarch64-apple-darwin/debug/deps/sha2_verif-3c53f8139e44348c.linked-mir.json";
 
 let UInt = mir_find_adt m "typenum::uint::UInt";
 let UTerm = mir_find_adt m "typenum::uint::UTerm" [];
@@ -102,6 +103,40 @@ default_ov <- mir_verify m sha384_default_id [] false sha384_default_spec z3;
 let sha384_new_id = mir_find_name m "digest::digest::{impl#0}::new" [mir_adt Sha384];
 mir_verify m sha384_new_id [default_ov] false sha384_default_spec z3;
 
+let sigma0_spec = do {
+    x <- mir_fresh_var "x" mir_u64;
+
+    mir_execute_func [mir_term x];
+
+    mir_return (mir_term {{ SHA384::s0 x }});
+};
+
+sigma0_ov <- mir_verify m "sha2::sha512::soft::sha512_schedule_x2::sigma0" [] false sigma0_spec z3;
+
+let sigma1_spec = do {
+    x <- mir_fresh_var "x" mir_u64;
+
+    mir_execute_func [mir_term x];
+
+    mir_return (mir_term {{ SHA384::s1 x }});
+};
+
+sigma1_ov <- mir_verify m "sha2::sha512::soft::sha512_schedule_x2::sigma1" [] false sigma1_spec z3;
+
+let sha512_digest_round_spec = do {
+    ae <- mir_fresh_var "ae" (mir_array 2 mir_u64);
+    bf <- mir_fresh_var "bf" (mir_array 2 mir_u64);
+    cg <- mir_fresh_var "cg" (mir_array 2 mir_u64);
+    dh <- mir_fresh_var "dh" (mir_array 2 mir_u64);
+    wk0 <- mir_fresh_var "wk0" mir_u64;
+
+    mir_execute_func [mir_term ae, mir_term bf, mir_term cg, mir_term dh, mir_term wk0];
+
+    mir_return (mir_term {{ Sha512::sha512_digest_round ae bf cg dh wk0 }});
+};
+
+sha512_digest_round_ov <- mir_verify m "sha2::sha512::soft::sha512_digest_round" [] false sha512_digest_round_spec z3;
+
 let sha512_digest_block_u64_spec = do {
     state_arr <- mir_fresh_var "state_arr" (mir_array 8 mir_u64);
     state_ref <- mir_ref_of_mut (mir_term state_arr);
@@ -114,8 +149,10 @@ let sha512_digest_block_u64_spec = do {
 };
 
 let sha512_digest_block_u64_id = "sha2::sha512::soft::sha512_digest_block_u64";
-// digest_block_u64_ov <- mir_verify m sha512_digest_block_u64_id [] false sha512_digest_block_u64_spec z3;
-digest_block_u64_ov <- mir_unsafe_assume_spec m sha512_digest_block_u64_id sha512_digest_block_u64_spec;
+digest_block_u64_ov <- mir_verify m sha512_digest_block_u64_id
+    [sigma0_ov, sigma1_ov, sha512_digest_round_ov]
+    false sha512_digest_block_u64_spec
+    (unint_z3 ["S0", "S1", "s0", "s1", "Ch", "Maj"]);
 
 let sha384_update_spec (len : Int) = do {
     h <- mir_fresh_var "h" (mir_array 8 mir_u64);
