@@ -3,6 +3,9 @@ import "Sha2Verif/Sha512.cry" as Sha512;
 
 m <- mir_load_module "target/aarch64-apple-darwin/debug/deps/sha2_verif-3c53f8139e44348c.linked-mir.json";
 
+let hello_len = 11;
+let long_message_len = 335;
+
 let UInt = mir_find_adt m "typenum::uint::UInt";
 let UTerm = mir_find_adt m "typenum::uint::UTerm" [];
 let B1 = mir_find_adt m "typenum::bit::B1" [];
@@ -73,18 +76,18 @@ let Result_new = mir_find_adt m "core::result::Result" [mir_adt Sha512VarCore, m
 let PhantomDataEager = mir_find_adt m "core::marker::PhantomData" [mir_adt Eager];
 let PhantomDataSha384 = mir_find_adt m "core::marker::PhantomData" [mir_tuple [mir_adt U48, mir_adt OidSha384]];
 
-let sha384_value h block n sz =
+let sha384_value state buffer pos block_len =
     mir_struct_value CoreWrapper
         [ mir_struct_value CtVariableCoreWrapper
             [ mir_struct_value Sha512VarCore
-                [ mir_term h
-                , mir_term sz
+                [ mir_term state
+                , mir_term block_len
                 ]
             , mir_struct_value PhantomDataSha384 []
             ]
         , mir_struct_value BlockBuffer
-            [ mir_struct_value Block [mir_term block]
-            , mir_term n
+            [ mir_struct_value Block [mir_term buffer]
+            , mir_term pos
             , mir_struct_value PhantomDataEager []
             ]
         ];
@@ -93,7 +96,12 @@ let sha384_default_spec = do {
     mir_execute_func [];
 
     let init = {{ SHA384::SHAInit }};
-    let res = sha384_value {{ init.h }} {{ init.block }} {{ drop (init.n) : [8] }} {{ init.sz }};
+    let res =
+        sha384_value
+            {{ init.h }}
+            {{ init.block }}
+            {{ drop (init.n) : [8] }}
+            {{ (init.sz / 8 - zext init.n) / 128 }};
     mir_return res;
 };
 
@@ -154,12 +162,14 @@ digest_block_u64_ov <- mir_verify m sha512_digest_block_u64_id
     false sha512_digest_block_u64_spec
     (unint_z3 ["S0", "S1", "s0", "s1", "Ch", "Maj"]);
 
-let sha384_update_spec (len : Int) = do {
-    h <- mir_fresh_var "h" (mir_array 8 mir_u64);
-    block <- mir_fresh_var "block" (mir_array 128 mir_u8);
-    n <- mir_fresh_var "n" mir_u8;
-    sz <- mir_fresh_var "sz" mir_u128;
-    let self = sha384_value h block n sz;
+let possible_pos = map eval_int (eval_list {{ [0..<128] : [_][8] }});
+
+let sha384_update_spec (len : Int) (pos : Int) = do {
+    state <- mir_fresh_var "state" (mir_array 8 mir_u64);
+    buffer <- mir_fresh_var "buffer" (mir_array 128 mir_u8);
+    block_len <- mir_fresh_var "block_len" mir_u128;
+    mir_precond {{ block_len < 0x00400000000000000000000000000000 - (`len + `pos) / 128 }};
+    let self = sha384_value state buffer {{ `pos : [8] }} block_len;
     self_ref <- mir_ref_of_mut self;
     data_arr <- mir_fresh_var "data_arr" (mir_array len mir_u8);
     data_ref <- mir_ref_of (mir_term data_arr);
@@ -167,32 +177,55 @@ let sha384_update_spec (len : Int) = do {
 
     mir_execute_func [self_ref, data_slice];
 
-    let sinit = {{ { h = h, block = block, n = (zext n : [32]), sz = sz } : SHA384::SHAState }};
+    let sinit = {{ { h = state, block = buffer, n = (`pos : [32]), sz = (block_len * 128 + `pos) * 8 } : SHA384::SHAState }};
     let supdated = {{ SHA384::SHAUpdate sinit data_arr }};
-    mir_points_to self_ref (sha384_value {{ supdated.h }} {{ supdated.block }} {{ drop (supdated.n) : [8] }} {{ supdated.sz }});
+    buffer' <- mir_fresh_var "buffer'" (mir_array 128 mir_u8);
+    mir_postcond
+        (if eval_bool {{ `pos + `len < 128 }}
+            then {{ buffer' == supdated.block }}
+            else {{ take`{(pos + len) % 128} buffer' == take supdated.block }});
+    mir_points_to self_ref
+        (sha384_value
+            {{ supdated.h }}
+            {{ buffer' }}
+            {{ drop (supdated.n) : [8] }}
+            {{ (supdated.sz / 8 - zext supdated.n) / 128 }});
 };
 
 let sha384_update_id = mir_find_name m "digest::core_api::wrapper::{impl#7}::update" [mir_adt CtVariableCoreWrapper];
-// update_ov <- mir_verify m sha384_update_id [digest_block_u64_ov] false (sha384_update_spec 2) z3;
-update_ov <- mir_unsafe_assume_spec m sha384_update_id (sha384_update_spec 11);
+let verify_updates (len : Int) : TopLevel [MIRSpec] = do {
+    for possible_pos (\pos -> do {
+        print (str_concats ["Verifying update for len = ", show len, ", pos = ", show pos]);
+        mir_verify m sha384_update_id [digest_block_u64_ov] false
+            (sha384_update_spec len pos)
+            (unint_z3 ["processBlock_Common"]);
+    });
+};
+update_hello_ovs <- verify_updates hello_len;
+update_long_message_ovs <- verify_updates long_message_len;
 
-let sha384_finalize_spec = do {
+let sha384_finalize_spec pos = do {
     h <- mir_fresh_var "h" (mir_array 8 mir_u64);
     block <- mir_fresh_var "block" (mir_array 128 mir_u8);
-    n <- mir_fresh_var "n" mir_u8;
-    sz <- mir_fresh_var "sz" mir_u128;
-    let self = sha384_value h block n sz;
+    block_len <- mir_fresh_var "block_len" mir_u128;
+    mir_precond {{ block_len < 0x00400000000000000000000000000000 }};
+    let self = sha384_value h block {{ `pos : [8] }} block_len;
 
     mir_execute_func [self];
 
-    let s = {{ { h = h, block = block, n = (zext n : [32]), sz = sz } : SHA384::SHAState }};
+    let s = {{ { h = h, block = take`{pos} block # zero, n = (`pos : [32]), sz = (block_len * 128 + `pos) * 8 } : SHA384::SHAState }};
     let output = mir_struct_value (GenericArray [mir_u8, mir_adt U48]) [mir_term {{ split (SHA384::SHAFinal s) : [48][8] }}];
     mir_return output;
 };
 
 let sha384_finalize_id = mir_find_name m "digest::digest::{impl#0}::finalize" [mir_adt Sha384];
-// finalize_ov <- mir_verify m sha384_finalize_id [digest_block_u64_ov] false sha384_finalize_spec z3;
-finalize_ov <- mir_unsafe_assume_spec m sha384_finalize_id sha384_finalize_spec;
+finalize_ovs <-
+    for possible_pos (\pos -> do {
+        print (str_concat "Verifying finalize for pos = " (show pos));
+        mir_verify m sha384_finalize_id [digest_block_u64_ov] false
+            (sha384_finalize_spec pos)
+            (unint_z3 ["processBlock_Common"]);
+    });
 
 let sha384_digest_spec (len : Int) = do {
     data_arr <- mir_fresh_var "data_arr" (mir_array len mir_u8);
@@ -204,5 +237,11 @@ let sha384_digest_spec (len : Int) = do {
     mir_return output;
 };
 
-let sha384_digest_id = mir_find_name m "digest::digest::{impl#0}::digest" [mir_adt Sha384, mir_ref (mir_array 11 mir_u8)];
-mir_verify m sha384_digest_id [default_ov, update_ov, finalize_ov] false (sha384_digest_spec 11) (w4_unint_z3 ["processBlock_Common"]);
+let verify_digest (len : Int) (update_ovs : [MIRSpec]) = do {
+    let sha384_digest_id = mir_find_name m "digest::digest::{impl#0}::digest" [mir_adt Sha384, mir_ref (mir_array len mir_u8)];
+    mir_verify m sha384_digest_id (concat [default_ov] (concat update_ovs finalize_ovs)) false
+        (sha384_digest_spec len)
+        (unint_z3 ["processBlock_Common"]);
+};
+verify_digest hello_len update_hello_ovs;
+verify_digest long_message_len update_long_message_ovs;
