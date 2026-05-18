@@ -76,6 +76,17 @@ let Result_new = mir_find_adt m "core::result::Result" [mir_adt Sha512VarCore, m
 let PhantomDataEager = mir_find_adt m "core::marker::PhantomData" [mir_adt Eager];
 let PhantomDataSha384 = mir_find_adt m "core::marker::PhantomData" [mir_tuple [mir_adt U48, mir_adt OidSha384]];
 
+// state in Rust is the same as h in cryptol-specs.
+//
+// buffer in Rust is the same as block in cryptol-specs.
+//
+// pos in Rust is the same as n in cryptol-specs.
+//
+// block_len in Rust is *not* sz in cryptol-specs. block_len is the number of
+// blocks that have been compressed so far, while sz is the total number of
+// *bits* that have been processed so far, including the ones just sitting in
+// the buffer and not yet compressed. So we have sz = (block_len * 128 + pos) *
+// 8.
 let sha384_value state buffer pos block_len =
     mir_struct_value CoreWrapper
         [ mir_struct_value CtVariableCoreWrapper
@@ -168,6 +179,10 @@ let sha384_update_spec (len : Int) (pos : Int) = do {
     state <- mir_fresh_var "state" (mir_array 8 mir_u64);
     buffer <- mir_fresh_var "buffer" (mir_array 128 mir_u8);
     block_len <- mir_fresh_var "block_len" mir_u128;
+    // Avoid overflow of sz. Since sz is 128-bit, the maximum block_len we can
+    // have is therefore 2^128 / (128 * 8), but we also need to account for
+    // increases in block_len during the update itself, which would be (len +
+    // pos) / 128.
     mir_precond {{ block_len < 0x00400000000000000000000000000000 - (`len + `pos) / 128 }};
     let self = sha384_value state buffer {{ `pos : [8] }} block_len;
     self_ref <- mir_ref_of_mut self;
@@ -180,6 +195,12 @@ let sha384_update_spec (len : Int) (pos : Int) = do {
     let sinit = {{ { h = state, block = buffer, n = (`pos : [32]), sz = (block_len * 128 + `pos) * 8 } : SHA384::SHAState }};
     let supdated = {{ SHA384::SHAUpdate sinit data_arr }};
     buffer' <- mir_fresh_var "buffer'" (mir_array 128 mir_u8);
+    // cryptol-specs zeros out the buffer after each compression, while the Rust
+    // code doesn't. So if there was no compression (pos + len < 128), then the
+    // resulting buffers should be exactly the same, while if there was
+    // compression, then the buffers would be the same up to the new pos (after
+    // which the cryptol-specs version would have zeros and the Rust version
+    // would have data from the previous iteration of the buffer).
     mir_postcond
         (if eval_bool {{ `pos + `len < 128 }}
             then {{ buffer' == supdated.block }}
@@ -206,14 +227,18 @@ update_long_message_ovs <- verify_updates long_message_len;
 
 let sha384_finalize_spec pos = do {
     h <- mir_fresh_var "h" (mir_array 8 mir_u64);
-    block <- mir_fresh_var "block" (mir_array 128 mir_u8);
+    buffer <- mir_fresh_var "buffer" (mir_array 128 mir_u8);
     block_len <- mir_fresh_var "block_len" mir_u128;
+    // Avoid overflow of sz (and also bit_len in Rust).
     mir_precond {{ block_len < 0x00400000000000000000000000000000 }};
-    let self = sha384_value h block {{ `pos : [8] }} block_len;
+    let self = sha384_value h buffer {{ `pos : [8] }} block_len;
 
     mir_execute_func [self];
 
-    let s = {{ { h = h, block = take`{pos} block # zero, n = (`pos : [32]), sz = (block_len * 128 + `pos) * 8 } : SHA384::SHAState }};
+    // cryptol-specs assumes the block is zeroed out, but the Rust code doesn't
+    // do that, so we need to zero out the part after pos before calling
+    // SHAFinal.
+    let s = {{ { h = h, block = take`{pos} buffer # zero, n = (`pos : [32]), sz = (block_len * 128 + `pos) * 8 } : SHA384::SHAState }};
     let output = mir_struct_value (GenericArray [mir_u8, mir_adt U48]) [mir_term {{ split (SHA384::SHAFinal s) : [48][8] }}];
     mir_return output;
 };
