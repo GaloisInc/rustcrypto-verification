@@ -108,7 +108,7 @@ thm_seqMap_composition <- prove_print
   do {
     // Turn the Cryptol::seqMap calls into Prelude::map calls, then use the
     // Prelude::map_map axiom to merge them.
-    simplify (add_prelude_eqs ["map_map"] (cryptol_ss ()));
+    simplify (add_core_thms ["map_map"] (cryptol_ss ()));
 
     // Turn the projections on Eq dictionaries into direct calls to vecEq and
     // bvEq.
