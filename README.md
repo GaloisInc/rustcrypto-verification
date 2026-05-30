@@ -6,10 +6,10 @@ against specifications from
 
 ## Current status
 
-| Crate | Version | Status
+| Crate | Version | Verified
 | --- | --- | --- |
-| [`aes`](https://crates.io/crates/aes/0.8.4) | `0.8.4` | Verified |
-| [`sha2`](https://crates.io/crates/sha2/0.10.9) | `0.10.9` | In progress |
+| [`aes`](https://crates.io/crates/aes/0.8.4) | `0.8.4` | AES-128, AES-192, AES-256 |
+| [`sha2`](https://crates.io/crates/sha2/0.10.9) | `0.10.9` | SHA-384, SHA-512 |
 
 ## Development
 

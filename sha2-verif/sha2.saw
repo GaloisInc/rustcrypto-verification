@@ -1,12 +1,37 @@
-import "../cryptol-specs/Primitive/Keyless/Hash/SHA2Internal/SHA384.cry" as SHA384;
-import "Sha2Verif/Sha512.cry" as Sha512;
+// Verification of SHA-512 and SHA-384 from the Rust sha2 crate against the
+// cryptol-specs SHA2Internal specification.
+//
+// SHA-2 operates on inputs of any length, and SAW doesn't let us verify that it
+// works for every possible length, but instead we verify that:
+// - The core compression function (which operates on fixed-length blocks) is
+//   correct.
+// - The state initialization function is correct.
+// - The update function is correct, starting with arbitrary internal state, and
+//   given inputs of two different lengths. One of the lengths is several blocks
+//   long so that, in conjunction with the arbitrary starting state, all code
+//   paths in the update function should be verified.
+// - The finalize function (which does not depend on the input length) is
+//   correct.
+// - The high-level digest function is correct for two different lengths. This
+//   is just a thin wrapper over state initialization, update, and finalize, so
+//   since we have verified those extensively, we can be reasonably sure that
+//   digest is correct.
+
+import "Sha2Verif/Rust.cry" as Sha2Rust;
+
+// These Cryptol modules will be abstracted over as `CryptolModule`s in this
+// script, so we need to import them with cryptol_load.
+SHA384Spec <- cryptol_load
+    "../cryptol-specs/Primitive/Keyless/Hash/SHA2Internal/SHA384.cry";
+SHA512Spec <- cryptol_load "Sha2Verif/Spec/SHA512.cry";
 
 // Note: platform-specific path to the mir-json output. You will have to change
 // this if not running on Mac.
-m <- mir_load_module "target/aarch64-apple-darwin/debug/deps/sha2_verif-3c53f8139e44348c.linked-mir.json";
+m <- mir_load_module
+    "target/aarch64-apple-darwin/debug/deps/sha2_verif-3c53f8139e44348c.linked-mir.json";
 
 // Lengths of the sample inputs to digest, from lib.rs. We will verify that
-// SHA-2 works correctly both of these lengths.
+// SHA-2 works correctly for inputs of both of these lengths.
 let hello_len = 11;
 let long_message_len = 335;
 
@@ -70,18 +95,70 @@ let U128 = UInt [
 let GenericArray = mir_find_adt m "generic_array::GenericArray";
 let Block = GenericArray [mir_u8, mir_adt U128];
 let Eager = mir_find_adt m "block_buffer::Eager" [];
-let BlockBuffer = mir_find_adt m "block_buffer::BlockBuffer" [mir_adt U128, mir_adt Eager];
+let BlockBuffer =
+    mir_find_adt m "block_buffer::BlockBuffer" [mir_adt U128, mir_adt Eager];
 let Sha512VarCore = mir_find_adt m "sha2::core_api::Sha512VarCore" [];
-let OidSha384 = mir_find_adt m "sha2::OidSha384" [];
-let InvalidOutputSize = mir_find_adt m "digest::InvalidOutputSize" [];
-let CtVariableCoreWrapper = mir_find_adt m "digest::core_api::ct_variable::CtVariableCoreWrapper" [mir_adt Sha512VarCore, mir_adt U48, mir_adt OidSha384];
-let CoreWrapper = mir_find_adt m "digest::core_api::wrapper::CoreWrapper" [mir_adt CtVariableCoreWrapper];
-let Sha384 = CoreWrapper;
-let Result_new = mir_find_adt m "core::result::Result" [mir_adt Sha512VarCore, mir_adt InvalidOutputSize];
-let PhantomDataEager = mir_find_adt m "core::marker::PhantomData" [mir_adt Eager];
-let PhantomDataSha384 = mir_find_adt m "core::marker::PhantomData" [mir_tuple [mir_adt U48, mir_adt OidSha384]];
+let PhantomData = mir_find_adt m "core::marker::PhantomData";
+let PhantomDataEager = PhantomData [mir_adt Eager];
 
-// Construct a Sha384 Rust value.
+// All the information needed to describe a SHA-2 implementation with a
+// particular digest size and 512-bit state.
+typedef ShaSize = {
+    // Name of the algorithm.
+    name : String,
+    // The instantiation of SHA2Internal from cryptol-specs for this specific
+    // size.
+    Spec : CryptolModule,
+    // The digest size encoded as a typenum ADT.
+    UDigestSize : MIRAdt,
+    // The instantiation of CtVariableCoreWrapper for this digest size.
+    CtVariableCoreWrapper : MIRAdt,
+    // The instantiation of CoreWrapper for this digest size.
+    CoreWrapper : MIRAdt,
+    // The instantiation of PhantomData for the second field of
+    // CtVariableCoreWrapper for this digest size.
+    PhantomDataSha : MIRAdt
+};
+
+// Create a ShaSize value given the name, Cryptol spec instantiation, digest
+// size typenum, and Oid ADT.
+let mk_sha_size (name : String)
+                (Spec : CryptolModule)
+                (UDigestSize : MIRAdt)
+                (Oid : MIRAdt)
+                : ShaSize =
+    let CtVariableCoreWrapper =
+        mir_find_adt m "digest::core_api::ct_variable::CtVariableCoreWrapper" [
+            mir_adt Sha512VarCore,
+            mir_adt UDigestSize,
+            mir_adt Oid
+        ] in
+    {
+        name = name,
+        Spec = Spec,
+        UDigestSize = UDigestSize,
+        CtVariableCoreWrapper = CtVariableCoreWrapper,
+        CoreWrapper =
+            mir_find_adt m "digest::core_api::wrapper::CoreWrapper" [
+                mir_adt CtVariableCoreWrapper
+            ],
+        PhantomDataSha =
+            PhantomData [
+                mir_tuple [mir_adt UDigestSize, mir_adt Oid]
+            ]
+    };
+
+// SHA-2 implementation with 512-bit state and 512-bit digest.
+let OidSha512 = mir_find_adt m "sha2::OidSha512" [];
+let sha512 = mk_sha_size "SHA-512" SHA512Spec U64 OidSha512;
+
+// SHA-2 implementation with 512-bit state and 384-bit digest.
+let OidSha384 = mir_find_adt m "sha2::OidSha384" [];
+let sha384 = mk_sha_size "SHA-384" SHA384Spec U48 OidSha384;
+
+// Construct a CoreWrapper Rust value for a SHA size given the state, buffer,
+// pos, and block_len variables. This is aliased as the top-level Sha type in
+// Rust (e.g. Sha512, Sha384).
 //
 // state in Rust is the same as h in cryptol-specs.
 //
@@ -94,61 +171,101 @@ let PhantomDataSha384 = mir_find_adt m "core::marker::PhantomData" [mir_tuple [m
 // *bits* that have been processed so far, including the ones just sitting in
 // the buffer and not yet compressed. So we have sz = (block_len * 128 + pos) *
 // 8.
-let sha384_value state buffer pos block_len =
-    mir_struct_value CoreWrapper
-        [ mir_struct_value CtVariableCoreWrapper
-            [ mir_struct_value Sha512VarCore
-                [ mir_term state
-                , mir_term block_len
-                ]
-            , mir_struct_value PhantomDataSha384 []
-            ]
-        , mir_struct_value BlockBuffer
-            [ mir_struct_value Block [mir_term buffer]
-            , mir_term pos
-            , mir_struct_value PhantomDataEager []
-            ]
+let mk_sha_value (sha : ShaSize)
+                 (state : Term /* [8][64] */)
+                 (buffer : Term /* [128][8] */)
+                 (pos : Term /* [8] */)
+                 (block_len : Term /* [128] */)
+                 : MIRValue =
+    mir_struct_value sha.CoreWrapper [
+        mir_struct_value sha.CtVariableCoreWrapper [
+            mir_struct_value Sha512VarCore [
+                mir_term state,
+                mir_term block_len
+            ],
+            mir_struct_value sha.PhantomDataSha []
+        ],
+        mir_struct_value BlockBuffer [
+            mir_struct_value Block [
+                mir_term buffer
+            ],
+            mir_term pos,
+            mir_struct_value PhantomDataEager []
+        ]
+    ];
+
+// Given a SHAState, derive the corresponding block_len from its sz and n
+// variables.
+let block_len_from_SHAState (s : Term /* SHAState */) : Term /* [128] */ =
+    {{ (s.sz / 8 - zext s.n) / 128 }};
+
+// Verify the default and new functions for a SHA size. Return the override for
+// default.
+let verify_default (sha : ShaSize) : TopLevel MIRSpec = do {
+    init <- cryptol_extract sha.Spec "SHAInit";
+
+    let default_spec = do {
+        mir_execute_func [];
+
+        let res =
+            mk_sha_value sha
+                {{ init.h }}
+                {{ init.block }}
+                {{ drop (init.n) : [8] }}
+                (block_len_from_SHAState init);
+        mir_return res;
+    };
+
+    print (str_concats ["Verifying default and new for ", sha.name]);
+
+    let default_id =
+        mir_find_name m "digest::core_api::wrapper::{impl#17}::default" [
+            mir_adt sha.CtVariableCoreWrapper
         ];
+    default_ov <- mir_verify m default_id [] false default_spec z3;
 
-let sha384_default_spec = do {
-    mir_execute_func [];
+    let new_id =
+        mir_find_name m "digest::digest::{impl#0}::new" [
+            mir_adt sha.CoreWrapper
+        ];
+    mir_verify m new_id [default_ov] false default_spec z3;
 
-    let init = {{ SHA384::SHAInit }};
-    let res =
-        sha384_value
-            {{ init.h }}
-            {{ init.block }}
-            {{ drop (init.n) : [8] }}
-            {{ (init.sz / 8 - zext init.n) / 128 }};
-    mir_return res;
+    return default_ov;
 };
 
-let sha384_default_id = mir_find_name m "digest::core_api::wrapper::{impl#17}::default" [mir_adt CtVariableCoreWrapper];
-default_ov <- mir_verify m sha384_default_id [] false sha384_default_spec z3;
+sha512_default_ov <- verify_default sha512;
+sha384_default_ov <- verify_default sha384;
 
-let sha384_new_id = mir_find_name m "digest::digest::{impl#0}::new" [mir_adt Sha384];
-mir_verify m sha384_new_id [default_ov] false sha384_default_spec z3;
-
-let sigma0_spec = do {
+// Spec for sha2::sha512::soft::sha512_schedule_x2::sigma0. We verify it against
+// the s0 function from the SHA-512 Cryptol spec.
+let sha512_sigma0_spec = do {
     x <- mir_fresh_var "x" mir_u64;
 
     mir_execute_func [mir_term x];
 
-    mir_return (mir_term {{ SHA384::s0 x }});
+    mir_return (mir_term {{ SHA512Spec::s0 x }});
 };
 
-sigma0_ov <- mir_verify m "sha2::sha512::soft::sha512_schedule_x2::sigma0" [] false sigma0_spec z3;
+sha512_sigma0_ov <-
+    mir_verify m "sha2::sha512::soft::sha512_schedule_x2::sigma0"
+        [] false sha512_sigma0_spec z3;
 
-let sigma1_spec = do {
+// Spec for sha2::sha512::soft::sha512_schedule_x2::sigma1. We verify it against
+// the s1 function from the SHA-512 Cryptol spec.
+let sha512_sigma1_spec = do {
     x <- mir_fresh_var "x" mir_u64;
 
     mir_execute_func [mir_term x];
 
-    mir_return (mir_term {{ SHA384::s1 x }});
+    mir_return (mir_term {{ SHA512Spec::s1 x }});
 };
 
-sigma1_ov <- mir_verify m "sha2::sha512::soft::sha512_schedule_x2::sigma1" [] false sigma1_spec z3;
+sha512_sigma1_ov <-
+    mir_verify m "sha2::sha512::soft::sha512_schedule_x2::sigma1"
+        [] false sha512_sigma1_spec z3;
 
+// Spec for sha2::sha512::soft::sha512_digest_round. It uses the S0, S1, Ch, and
+// Maj functions from the SHA-512 Cryptol spec.
 let sha512_digest_round_spec = do {
     ae <- mir_fresh_var "ae" (mir_array 2 mir_u64);
     bf <- mir_fresh_var "bf" (mir_array 2 mir_u64);
@@ -156,142 +273,285 @@ let sha512_digest_round_spec = do {
     dh <- mir_fresh_var "dh" (mir_array 2 mir_u64);
     wk0 <- mir_fresh_var "wk0" mir_u64;
 
-    mir_execute_func [mir_term ae, mir_term bf, mir_term cg, mir_term dh, mir_term wk0];
+    mir_execute_func [
+        mir_term ae,
+        mir_term bf,
+        mir_term cg,
+        mir_term dh,
+        mir_term wk0
+    ];
 
-    mir_return (mir_term {{ Sha512::sha512_digest_round ae bf cg dh wk0 }});
+    mir_return (mir_term {{ Sha2Rust::sha512_digest_round ae bf cg dh wk0 }});
 };
 
-sha512_digest_round_ov <- mir_verify m "sha2::sha512::soft::sha512_digest_round" [] false sha512_digest_round_spec z3;
+sha512_digest_round_ov <-
+    mir_verify m "sha2::sha512::soft::sha512_digest_round"
+        [] false sha512_digest_round_spec z3;
 
-let sha512_digest_block_u64_spec = do {
-    state_arr <- mir_fresh_var "state_arr" (mir_array 8 mir_u64);
-    state_ref <- mir_ref_of_mut (mir_term state_arr);
-    block_arr <- mir_fresh_var "block_arr" (mir_array 16 mir_u64);
-    block_ref <- mir_ref_of (mir_term block_arr);
+// Verify the sha512_digest_block_u64 functions for a SHA size, applying the
+// SHA-512 overrides for Sigma0, Sigma1, and sha512_digest_round, then applying
+// the given proof tactics before calling a solver with S0, S1, s0, s1, Ch, and
+// Maj uninterpreted.
+let verify_digest_block_u64 (sha : ShaSize)
+                            (tactics : ProofScript ())
+                            : TopLevel MIRSpec = do {
+    let Spec = sha.Spec;
 
-    mir_execute_func [state_ref, block_ref];
+    let digest_block_u64_spec = do {
+        state_arr <- mir_fresh_var "state_arr" (mir_array 8 mir_u64);
+        state_ref <- mir_ref_of_mut (mir_term state_arr);
+        block_arr <- mir_fresh_var "block_arr" (mir_array 16 mir_u64);
+        block_ref <- mir_ref_of (mir_term block_arr);
 
-    mir_points_to state_ref (mir_term {{ SHA384::processBlock_Common state_arr block_arr }});
+        mir_execute_func [state_ref, block_ref];
+
+        mir_points_to state_ref (mir_term {{
+            Spec::processBlock_Common state_arr block_arr
+        }});
+    };
+
+    print (str_concats ["Verifying sha512_digest_block_u64 for ", sha.name]);
+
+    let digest_block_u64_id = "sha2::sha512::soft::sha512_digest_block_u64";
+    mir_verify m digest_block_u64_id
+        [sha512_sigma0_ov, sha512_sigma1_ov, sha512_digest_round_ov]
+        false
+        digest_block_u64_spec
+        do {
+            tactics;
+            unint_z3 ["S0", "S1", "s0", "s1", "Ch", "Maj"];
+        };
 };
 
-let sha512_digest_block_u64_id = "sha2::sha512::soft::sha512_digest_block_u64";
-digest_block_u64_ov <- mir_verify m sha512_digest_block_u64_id
-    [sigma0_ov, sigma1_ov, sha512_digest_round_ov]
-    false sha512_digest_block_u64_spec
-    (unint_z3 ["S0", "S1", "s0", "s1", "Ch", "Maj"]);
+// No additional proof tactics needed to verify sha512_digest_block_u64 for
+// SHA-512.
+sha512_digest_block_u64_ov <- verify_digest_block_u64 sha512 (return ());
 
-// All possible values of pos in Rust, aka n in cryptol-specs.
+// sha512_digest_block_u64 is a monomorphic function that is used for both
+// SHA-512 and SHA-384, but we want to do mir_verify twice to verify it against
+// different instantiations of processBlock_Common from SHA512Spec and
+// SHA384Spec, so that the resulting overrides can be used directly in
+// higher-level functions which are specific to the digest size. However,
+// verifying sha512_digest_block_u64 itself requires overrides for sigma0,
+// sigma1, and sha512_digest_round, and we have only verified those against the
+// Cryptol functions from SHA512Spec. Instead of writing a SHA-384 version of
+// sha512_digest_round then re-verifying those three functions against the
+// SHA384Spec versions, we instead prove that S0, S1, s0, s1, Ch, and Maj are
+// the same for SHA-384 and SHA-512, and then continue to use the SHA-512
+// overrides when verifying sha512_digest_block_u64 for SHA-384, but apply
+// rewrites to turn SHA384Spec's processBlock_Common into SHA512Spec's
+// processBlock_Common, before invoking the solver.
+print "Proving equivalence of SHA-384 and SHA-512 logical functions";
+thms_sha384_fun_eq_sha512 <-
+    for [
+        {{ \x -> SHA384Spec::S0 x == SHA512Spec::S0 x }},
+        {{ \x -> SHA384Spec::S1 x == SHA512Spec::S1 x }},
+        {{ \x -> SHA384Spec::s0 x == SHA512Spec::s0 x }},
+        {{ \x -> SHA384Spec::s1 x == SHA512Spec::s1 x }},
+        {{ \x y z -> SHA384Spec::Ch x y z == SHA512Spec::Ch x y z }},
+        {{ \x y z -> SHA384Spec::Maj x y z == SHA512Spec::Maj x y z }}
+    ] (prove_print z3);
+
+sha384_digest_block_u64_ov <- verify_digest_block_u64 sha384 do {
+    // Unfold SHA384Spec::processBlock_Common until the S0, S1, s0, s1, Ch, and
+    // Maj functions are exposed.
+    unfolding [
+        "processBlock_Common",
+        "messageSchedule_Common",
+        "compress_Common"
+    ];
+    // Rewrite those functions from their SHA384Spec version to their SHA512Spec
+    // version, effectively turning the RHS of the equality into
+    // SHA512Spec::processBlock_Common.
+    simplify (addsimps thms_sha384_fun_eq_sha512 empty_ss);
+};
+
+// All possible values of pos in Rust, aka n in cryptol-specs. There is an
+// assumption that pos < 128 in both the Rust code and the Cryptol spec.
+//
+// Making pos symbolic when verifying update and finalize causes symbolic
+// execution to blow up the resulting term, so instead we fix pos in the specs
+// and separately verify update and finalize for all 128 possible values of pos.
 let possible_pos = map eval_int (eval_list {{ [0..<128] : [_][8] }});
 
-let sha384_update_spec (len : Int) (pos : Int) = do {
-    state <- mir_fresh_var "state" (mir_array 8 mir_u64);
-    buffer <- mir_fresh_var "buffer" (mir_array 128 mir_u8);
-    block_len <- mir_fresh_var "block_len" mir_u128;
-    // Avoid overflow of sz. Since sz is 128-bit, the maximum block_len we can
-    // have is therefore 2^128 / (128 * 8), but we also need to account for
-    // increases in block_len during the update itself, which would be (len +
-    // pos) / 128.
-    mir_precond {{ block_len < 0x00400000000000000000000000000000 - (`len + `pos) / 128 }};
-    let self = sha384_value state buffer {{ `pos : [8] }} block_len;
-    self_ref <- mir_ref_of_mut self;
-    data_arr <- mir_fresh_var "data_arr" (mir_array len mir_u8);
-    data_ref <- mir_ref_of (mir_term data_arr);
-    let data_slice = mir_slice_value data_ref;
+// Verify the update function for a SHA size, given the sha512_digest_block_u64
+// override for that size. Return overrides for all possible values of pos for
+// both sample input lengths.
+let verify_updates (sha : ShaSize)
+                   (digest_block_u64_ov : MIRSpec)
+                   : TopLevel [MIRSpec] = do {
+    let Spec = sha.Spec;
 
-    mir_execute_func [self_ref, data_slice];
+    let update_spec (len : Int) (pos : Int) = do {
+        state <- mir_fresh_var "state" (mir_array 8 mir_u64);
+        buffer <- mir_fresh_var "buffer" (mir_array 128 mir_u8);
+        block_len <- mir_fresh_var "block_len" mir_u128;
+        // Avoid overflow of sz. Since sz is 128-bit, the maximum block_len we
+        // can have is therefore 2^128 / (128 * 8), but to determine what the
+        // starting block_len should be, we also need to account for the
+        // increase in block_len during the update itself, which would be (len +
+        // pos) / 128.
+        mir_precond {{
+            block_len < fromInteger (2^^128 / (128 * 8)) - (`len + `pos) / 128
+        }};
+        let self = mk_sha_value sha state buffer {{ `pos : [8] }} block_len;
+        self_ref <- mir_ref_of_mut self;
+        data_arr <- mir_fresh_var "data_arr" (mir_array len mir_u8);
+        data_ref <- mir_ref_of (mir_term data_arr);
+        let data_slice = mir_slice_value data_ref;
 
-    let sinit = {{
-        { h = state
-        , block = buffer
-        , n = (`pos : [32])
-        , sz = (block_len * 128 + `pos) * 8
-        } : SHA384::SHAState
-    }};
-    let supdated = {{ SHA384::SHAUpdate sinit data_arr }};
-    buffer' <- mir_fresh_var "buffer'" (mir_array 128 mir_u8);
-    // cryptol-specs zeros out the buffer after each compression, while the Rust
-    // code doesn't. So if there was no compression (pos + len < 128), then the
-    // resulting buffers should be exactly the same, while if there was
-    // compression, then the buffers would be the same up to the new pos (after
-    // which the cryptol-specs version would have zeros and the Rust version
-    // would have data from the previous iteration of the buffer).
-    mir_postcond
-        (if eval_bool {{ `pos + `len < 128 }}
-            then {{ buffer' == supdated.block }}
-            else {{ take`{(pos + len) % 128} buffer' == take supdated.block }});
-    mir_points_to self_ref
-        (sha384_value
-            {{ supdated.h }}
-            {{ buffer' }}
-            {{ drop (supdated.n) : [8] }}
-            {{ (supdated.sz / 8 - zext supdated.n) / 128 }});
+        mir_execute_func [self_ref, data_slice];
+
+        let sinit = {{
+            { h = state
+            , block = buffer
+            , n = (`pos : [32])
+            , sz = (block_len * 128 + `pos) * 8
+            } : Spec::SHAState
+        }};
+        let supdated = {{ Spec::SHAUpdate sinit data_arr }};
+        buffer' <- mir_fresh_var "buffer'" (mir_array 128 mir_u8);
+        // cryptol-specs zeros out the buffer after each compression, while the
+        // Rust code doesn't. So if there was no compression (i.e. pos + len <
+        // 128), then the resulting buffers should be exactly the same, while if
+        // there was compression, then the buffers would be the same up to the
+        // new pos (after which the cryptol-specs version would have zeros and
+        // the Rust version would have data from the previous iteration of the
+        // buffer).
+        mir_postcond
+            (if eval_bool {{ `pos + `len < 128 }}
+                then {{
+                    buffer' == supdated.block
+                }}
+                else {{
+                    take`{(pos + len) % 128} buffer' == take supdated.block
+                }});
+        mir_points_to self_ref
+            (mk_sha_value sha
+                {{ supdated.h }}
+                {{ buffer' }}
+                {{ drop (supdated.n) : [8] }}
+                (block_len_from_SHAState supdated));
+    };
+
+    let update_id =
+        mir_find_name m "digest::core_api::wrapper::{impl#7}::update" [
+            mir_adt sha.CtVariableCoreWrapper
+        ];
+
+    let verify_for_len (len : Int) : TopLevel [MIRSpec] = do {
+        for possible_pos (\pos -> do {
+            print (str_concats [
+                "Verifying update for ", sha.name,
+                " (len = ", show len, ", pos = ", show pos, ")"
+            ]);
+            mir_verify m update_id [digest_block_u64_ov] false
+                (update_spec len pos)
+                (unint_z3 ["processBlock_Common"]);
+        });
+    };
+
+    update_hello_ovs <- verify_for_len hello_len;
+    update_long_message_ovs <- verify_for_len long_message_len;
+    return (concat update_hello_ovs update_long_message_ovs);
 };
 
-let sha384_update_id = mir_find_name m "digest::core_api::wrapper::{impl#7}::update" [mir_adt CtVariableCoreWrapper];
-let verify_updates (len : Int) : TopLevel [MIRSpec] = do {
+sha512_update_ovs <- verify_updates sha512 sha512_digest_block_u64_ov;
+sha384_update_ovs <- verify_updates sha384 sha384_digest_block_u64_ov;
+
+// Verify the finalize function for a SHA size, given the
+// sha512_digest_block_u64 override for that size. Return overrides for all
+// possible values of pos.
+let verify_finalize (sha : ShaSize)
+                    (digest_block_u64_ov : MIRSpec)
+                    : TopLevel [MIRSpec] = do {
+    let Spec = sha.Spec;
+
+    let finalize_spec (pos : Int) = do {
+        state <- mir_fresh_var "state" (mir_array 8 mir_u64);
+        buffer <- mir_fresh_var "buffer" (mir_array 128 mir_u8);
+        block_len <- mir_fresh_var "block_len" mir_u128;
+        // Avoid overflow of sz (and also bit_len in Rust). Since sz and bit_len
+        // are 128-bit, the maximum block_len we can have is therefore 2^128 /
+        // (128 * 8).
+        mir_precond {{ block_len < fromInteger (2^^128 / (128 * 8)) }};
+        let self = mk_sha_value sha state buffer {{ `pos : [8] }} block_len;
+
+        mir_execute_func [self];
+
+        // cryptol-specs assumes the block is zeroed out by update after each
+        // compression, but the Rust version of update doesn't do that, so we
+        // need to zero out the unused part after pos before calling SHAFinal.
+        let s = {{
+            { h = state
+            , block = take`{pos} buffer # zero
+            , n = (`pos : [32])
+            , sz = (block_len * 128 + `pos) * 8
+            } : Spec::SHAState
+        }};
+        let output =
+            mir_struct_value (GenericArray [mir_u8, mir_adt sha.UDigestSize]) [
+                mir_term {{ split (Spec::SHAFinal s) : [_][8] }}
+            ];
+        mir_return output;
+    };
+
+    let finalize_id =
+        mir_find_name m "digest::digest::{impl#0}::finalize" [
+            mir_adt sha.CoreWrapper
+        ];
     for possible_pos (\pos -> do {
-        print (str_concats ["Verifying update for len = ", show len, ", pos = ", show pos]);
-        mir_verify m sha384_update_id [digest_block_u64_ov] false
-            (sha384_update_spec len pos)
+        print (str_concats [
+            "Verifying finalize for ", sha.name, " (pos = ", show pos, ")"
+        ]);
+        mir_verify m finalize_id [digest_block_u64_ov] false
+            (finalize_spec pos)
             (unint_z3 ["processBlock_Common"]);
     });
 };
-update_hello_ovs <- verify_updates hello_len;
-update_long_message_ovs <- verify_updates long_message_len;
 
-let sha384_finalize_spec pos = do {
-    state <- mir_fresh_var "state" (mir_array 8 mir_u64);
-    buffer <- mir_fresh_var "buffer" (mir_array 128 mir_u8);
-    block_len <- mir_fresh_var "block_len" mir_u128;
-    // Avoid overflow of sz (and also bit_len in Rust). Since sz and bit_len are
-    // 128-bit, the maximum block_len we can have is therefore 2^128 / (128 *
-    // 8).
-    mir_precond {{ block_len < 0x00400000000000000000000000000000 }};
-    let self = sha384_value state buffer {{ `pos : [8] }} block_len;
+sha512_finalize_ovs <- verify_finalize sha512 sha512_digest_block_u64_ov;
+sha384_finalize_ovs <- verify_finalize sha384 sha384_digest_block_u64_ov;
 
-    mir_execute_func [self];
+// Verify the top-level digest function for a SHA size, given the default,
+// update, and finalize overrides for that size.
+let verify_digest (sha : ShaSize) (ovs : [MIRSpec]) = do {
+    let Spec = sha.Spec;
 
-    // cryptol-specs assumes the block is zeroed out by update, but the Rust
-    // version of update doesn't do that, so we need to zero out the part after
-    // pos before calling SHAFinal.
-    let s = {{
-        { h = state
-        , block = take`{pos} buffer # zero
-        , n = (`pos : [32])
-        , sz = (block_len * 128 + `pos) * 8
-        } : SHA384::SHAState
-    }};
-    let output = mir_struct_value (GenericArray [mir_u8, mir_adt U48]) [
-        mir_term {{ split (SHA384::SHAFinal s) : [48][8] }}
-    ];
-    mir_return output;
-};
+    let verify_for_len (len : Int) = do {
 
-let sha384_finalize_id = mir_find_name m "digest::digest::{impl#0}::finalize" [mir_adt Sha384];
-finalize_ovs <-
-    for possible_pos (\pos -> do {
-        print (str_concat "Verifying finalize for pos = " (show pos));
-        mir_verify m sha384_finalize_id [digest_block_u64_ov] false
-            (sha384_finalize_spec pos)
+        let digest_spec = do {
+            data_arr <- mir_fresh_var "data_arr" (mir_array len mir_u8);
+            data_ref <- mir_ref_of (mir_term data_arr);
+
+            mir_execute_func [data_ref];
+
+            let output =
+                mir_struct_value
+                    (GenericArray [mir_u8, mir_adt sha.UDigestSize]) [
+                        mir_term {{ split (Spec::SHAImp data_arr) : [_][8] }}
+                    ];
+            mir_return output;
+        };
+
+        print (str_concats [
+            "Verifying digest for ", sha.name, " (len = ", show len, ")"
+        ]);
+
+        let digest_id =
+            mir_find_name m "digest::digest::{impl#0}::digest" [
+                mir_adt sha.CoreWrapper,
+                mir_ref (mir_array len mir_u8)
+            ];
+        mir_verify m digest_id ovs false digest_spec
             (unint_z3 ["processBlock_Common"]);
-    });
+    };
 
-let sha384_digest_spec (len : Int) = do {
-    data_arr <- mir_fresh_var "data_arr" (mir_array len mir_u8);
-    data_ref <- mir_ref_of (mir_term data_arr);
-
-    mir_execute_func [data_ref];
-
-    let output = mir_struct_value (GenericArray [mir_u8, mir_adt U48]) [mir_term {{ split (SHA384::SHAImp data_arr) : [48][8] }}];
-    mir_return output;
+    verify_for_len hello_len;
+    verify_for_len long_message_len;
 };
 
-let verify_digest (len : Int) (update_ovs : [MIRSpec]) = do {
-    print (str_concat "Verifying digest for len = " (show len));
-    let sha384_digest_id = mir_find_name m "digest::digest::{impl#0}::digest" [mir_adt Sha384, mir_ref (mir_array len mir_u8)];
-    mir_verify m sha384_digest_id (concat [default_ov] (concat update_ovs finalize_ovs)) false
-        (sha384_digest_spec len)
-        (unint_z3 ["processBlock_Common"]);
-};
-verify_digest hello_len update_hello_ovs;
-verify_digest long_message_len update_long_message_ovs;
+verify_digest sha512
+    (concat [sha512_default_ov] (concat sha512_update_ovs sha512_finalize_ovs));
+verify_digest sha384
+    (concat [sha384_default_ov] (concat sha384_update_ovs sha384_finalize_ovs));

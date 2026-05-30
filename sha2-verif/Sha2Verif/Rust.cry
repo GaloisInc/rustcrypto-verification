@@ -1,0 +1,23 @@
+/**
+Cryptol specification for Rust functions in the `sha2` crate which don't
+correspond directly to any particular function from the SHA-2 spec in
+`cryptol-specs`.
+*/
+module Sha2Verif::Rust where
+
+import Sha2Verif::Spec::SHA512 as SHA512
+
+/**
+Specification for the `sha2::sha512::soft::sha512_digest_round` function.
+Basically a direct translation of the Rust code into Cryptol, but with the
+`big_sigma0!`, `big_sigma1!`, `bool3ary_202`, and `bool3ary_232` calls replaced
+with `S0`, `S1`, `Ch`, and `Maj` respectively from the SHA-512 instantiation of
+SHA2Internal in `cryptol-specs`.
+*/
+sha512_digest_round :
+  [2][64] -> [2][64] -> [2][64] -> [2][64] -> [64] -> [2][64]
+sha512_digest_round [a0, e0] [b0, f0] [c0, g0] [d0, h0] wk0 =
+  [x0 + y0, x0 + d0]
+  where
+  x0 = SHA512::S1 e0 + SHA512::Ch e0 f0 g0 + wk0 + h0
+  y0 = SHA512::S0 a0 + SHA512::Maj a0 b0 c0
