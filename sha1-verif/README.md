@@ -1,7 +1,7 @@
 # SHA-1
 
-Verification of SHA-1 from the [`sha1`](https://docs.rs/sha1/0.10.6/sha1/) crate
-against the [SHA-1
+Verification of SHA-1 from the [`sha1`](https://crates.io/crates/sha1/0.10.6)
+crate against the [SHA-1
 specification](../cryptol-specs/Primitive/Keyless/Hash/SHA1/Specification.cry)
 from `cryptol-specs`.
 
