@@ -1,4 +1,4 @@
-# SHA2
+# SHA-2
 
 Verification of SHA-512 and SHA-384 from the
 [`sha2`](https://crates.io/crates/sha2/0.10.9) crate against the [`SHA2Internal`
