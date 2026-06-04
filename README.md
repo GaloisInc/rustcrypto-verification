@@ -10,6 +10,7 @@ against specifications from
 | --- | --- | --- |
 | [`aes`](https://crates.io/crates/aes/0.8.4) | `0.8.4` | AES-128, AES-192, AES-256 |
 | [`sha2`](https://crates.io/crates/sha2/0.10.9) | `0.10.9` | SHA-384, SHA-512 |
+| [`sha1`](https://docs.rs/sha1/0.10.6/sha1/) | `0.10.6` | In progress |
 
 ## Development
 

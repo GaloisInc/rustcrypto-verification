@@ -1,0 +1,95 @@
+include_once "../utils/typenum.saw";
+
+import Primitive::Keyless::Hash::SHA1::Specification as SHA1;
+
+m <- mir_load_module
+    "target/aarch64-apple-darwin/debug/deps/sha1_verif-e3bbc04c5f30203e.linked-mir.json";
+
+let U = typenum_uint m;
+let GenericArray = mir_find_adt m "generic_array::GenericArray";
+let Block = GenericArray [mir_u8, mir_adt (U 64)];
+let Eager = mir_find_adt m "block_buffer::Eager" [];
+let BlockBuffer =
+    mir_find_adt m "block_buffer::BlockBuffer" [mir_adt (U 64), mir_adt Eager];
+let Sha1Core = mir_find_adt m "sha1::Sha1Core" [];
+let CoreWrapper =
+    mir_find_adt m "digest::core_api::wrapper::CoreWrapper" [mir_adt Sha1Core];
+let PhantomDataEager =
+    mir_find_adt m "core::marker::PhantomData" [mir_adt Eager];
+
+let mk_sha_value (h : Term /* [5][32] */)
+                 (buffer : Term /* [64][8] */)
+                 (pos : Term /* [8] */)
+                 (block_len : Term /* [64] */)
+                 : MIRValue =
+    mir_struct_value CoreWrapper [
+        mir_struct_value Sha1Core [
+            mir_term h,
+            mir_term block_len
+        ],
+        mir_struct_value BlockBuffer [
+            mir_struct_value Block [
+                mir_term buffer
+            ],
+            mir_term pos,
+            mir_struct_value PhantomDataEager []
+        ]
+    ];
+
+
+let {{
+    sha1rnds4 : ([32] -> [32] -> [32] -> [32]) -> [4][32] -> [4][32] -> [4][32]
+    sha1rnds4 f [a, b, c, d] [t, u, v, w] = [b'', c', d'', e'']
+        where
+        e = 0
+        e' = e + SHA1::ROTL`{5} a + f b c d + t
+        b' = SHA1::ROTL`{30} b
+        d' = d + SHA1::ROTL`{5} e' + f a b' c + u
+        a' = SHA1::ROTL`{30} a
+        c' = c + SHA1::ROTL`{5} d' + f e' a' b' + v
+        e'' = SHA1::ROTL`{30} e'
+        b'' = b' + SHA1::ROTL`{5} c' + f d' e'' a' + w
+        d'' = SHA1::ROTL`{30} d'
+}};
+
+let sha1rnds4_spec f = do {
+    abcd <- mir_fresh_var "abcd" (mir_array 4 mir_u32);
+    msg <- mir_fresh_var "msg" (mir_array 4 mir_u32);
+
+    mir_execute_func [mir_term abcd, mir_term msg];
+
+    mir_return (mir_term {{ sha1rnds4 f abcd msg }});
+};
+
+sha1rnds4c_ov <- mir_verify m "sha1::compress::soft::sha1rnds4c" [] false
+    (sha1rnds4_spec {{ SHA1::Ch }}) z3;
+sha1rnds4p_ov <- mir_verify m "sha1::compress::soft::sha1rnds4p" [] false
+    (sha1rnds4_spec {{ SHA1::Parity }}) z3;
+sha1rnds4m_ov <- mir_verify m "sha1::compress::soft::sha1rnds4m" [] false
+    (sha1rnds4_spec {{ SHA1::Maj }}) z3;
+
+let {{
+    sha1_digest_block_u32 : [5][32] -> [16][32] -> [5][32]
+    sha1_digest_block_u32 [h0, h1, h2, h3, h4] block =
+        [h0', h1', h2', h3', h4']
+        where
+        (h0', h1', h2', h3', h4') =
+            SHA1::sha1Block (h0, h1, h2, h3, h4) (join block)
+}};
+
+let sha1_digest_block_u32_spec = do {
+    state_init <- mir_fresh_var "state_init" (mir_array 5 mir_u32);
+    block <- mir_fresh_var "block" (mir_array 16 mir_u32);
+    state_ref <- mir_ref_of_mut (mir_term state_init);
+    block_ref <- mir_ref_of (mir_term block);
+
+    mir_execute_func [state_ref, block_ref];
+
+    mir_points_to state_ref
+        (mir_term {{ sha1_digest_block_u32 state_init block }});
+};
+
+mir_verify m "sha1::compress::soft::sha1_digest_block_u32"
+    [sha1rnds4c_ov, sha1rnds4p_ov, sha1rnds4m_ov]
+    false sha1_digest_block_u32_spec
+    (unint_z3 ["Ch", "Parity", "Maj"]);
