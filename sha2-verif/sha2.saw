@@ -17,7 +17,9 @@
 //   since we have verified those extensively, we can be reasonably sure that
 //   digest is correct.
 
-import "Sha2Verif/Rust.cry" as Sha2Rust;
+include_once "../utils/typenum.saw";
+
+import Sha2Verif::Rust as Sha2Rust;
 
 // These Cryptol modules will be abstracted over as `CryptolModule`s in this
 // script, so we need to import them with cryptol_load.
@@ -36,67 +38,12 @@ let hello_len = 11;
 let long_message_len = 335;
 
 // Rust types used by functions in the sha2 crate and its dependencies.
-let UInt = mir_find_adt m "typenum::uint::UInt";
-let UTerm = mir_find_adt m "typenum::uint::UTerm" [];
-let B1 = mir_find_adt m "typenum::bit::B1" [];
-let B0 = mir_find_adt m "typenum::bit::B0" [];
-let U1 = UInt [
-    mir_adt UTerm,
-    mir_adt B1
-];
-let U2 = UInt [
-    mir_adt U1,
-    mir_adt B0
-];
-let U3 = UInt [
-    mir_adt U1,
-    mir_adt B1
-];
-let U4 = UInt [
-    mir_adt U2,
-    mir_adt B0
-];
-let U6 = UInt [
-    mir_adt U3,
-    mir_adt B0
-];
-let U8 = UInt [
-    mir_adt U4,
-    mir_adt B0
-];
-let U12 = UInt [
-    mir_adt U6,
-    mir_adt B0
-];
-let U16 = UInt [
-    mir_adt U8,
-    mir_adt B0
-];
-let U24 = UInt [
-    mir_adt U12,
-    mir_adt B0
-];
-let U32 = UInt [
-    mir_adt U16,
-    mir_adt B0
-];
-let U64 = UInt [
-    mir_adt U32,
-    mir_adt B0
-];
-let U48 = UInt [
-    mir_adt U24,
-    mir_adt B0
-];
-let U128 = UInt [
-    mir_adt U64,
-    mir_adt B0
-];
+let U = typenum_uint m;
 let GenericArray = mir_find_adt m "generic_array::GenericArray";
-let Block = GenericArray [mir_u8, mir_adt U128];
+let Block = GenericArray [mir_u8, mir_adt (U 128)];
 let Eager = mir_find_adt m "block_buffer::Eager" [];
 let BlockBuffer =
-    mir_find_adt m "block_buffer::BlockBuffer" [mir_adt U128, mir_adt Eager];
+    mir_find_adt m "block_buffer::BlockBuffer" [mir_adt (U 128), mir_adt Eager];
 let Sha512VarCore = mir_find_adt m "sha2::core_api::Sha512VarCore" [];
 let PhantomData = mir_find_adt m "core::marker::PhantomData";
 let PhantomDataEager = PhantomData [mir_adt Eager];
@@ -150,11 +97,11 @@ let mk_sha_size (name : String)
 
 // SHA-2 implementation with 512-bit state and 512-bit digest.
 let OidSha512 = mir_find_adt m "sha2::OidSha512" [];
-let sha512 = mk_sha_size "SHA-512" SHA512Spec U64 OidSha512;
+let sha512 = mk_sha_size "SHA-512" SHA512Spec (U 64) OidSha512;
 
 // SHA-2 implementation with 512-bit state and 384-bit digest.
 let OidSha384 = mir_find_adt m "sha2::OidSha384" [];
-let sha384 = mk_sha_size "SHA-384" SHA384Spec U48 OidSha384;
+let sha384 = mk_sha_size "SHA-384" SHA384Spec (U 48) OidSha384;
 
 // Construct a CoreWrapper Rust value for a SHA size given the state, buffer,
 // pos, and block_len variables. This is aliased as the top-level Sha type in

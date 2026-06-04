@@ -1,0 +1,16 @@
+// Given a MIR module which includes the typenum crate, returns a function which
+// takes a SAWScript Int and returns the corresponding typenum UInt
+// instantiation.
+let typenum_uint (m : MIRModule) : Int -> MIRAdt =
+    let UInt = mir_find_adt m "typenum::uint::UInt" in
+    let UTerm = mir_find_adt m "typenum::uint::UTerm" [] in
+    let B1 = mir_find_adt m "typenum::bit::B1" [] in
+    let B0 = mir_find_adt m "typenum::bit::B0" [] in
+    rec U (n : Int) =
+        if eval_bool {{ `n == 0 }}
+            then UTerm
+            else UInt [
+                mir_adt (U (eval_size {| n / 2 |})),
+                mir_adt (if eval_bool {{ `n % 2 == 1 }} then B1 else B0)
+            ] in
+    U;

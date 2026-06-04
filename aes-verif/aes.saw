@@ -3,8 +3,10 @@
 
 enable_experimental;
 
-import "AesVerif/Bitslice.cry";
-import "AesVerif/ProofUtils.cry";
+include_once "../utils/typenum.saw";
+
+import AesVerif::Bitslice;
+import AesVerif::ProofUtils;
 
 // The Cryptol modules for specific sizes of AES will be abstracted over as
 // `CryptolModule`s in this script, so we need to import them with cryptol_load.
@@ -24,30 +26,10 @@ m <- mir_load_module
   "target/aarch64-apple-darwin/debug/deps/aes_verif-a7726c0105e8b76e.linked-mir.json";
 
 // Rust types used by functions in the aes crate.
-let UInt = mir_find_adt m "typenum::uint::UInt";
-let UTerm = mir_find_adt m "typenum::uint::UTerm" [];
-let B1 = mir_find_adt m "typenum::bit::B1" [];
-let B0 = mir_find_adt m "typenum::bit::B0" [];
-let U4 = UInt [
-  mir_adt (UInt [
-    mir_adt (UInt [
-      mir_adt UTerm,
-      mir_adt B1
-    ]),
-    mir_adt B0
-  ]),
-  mir_adt B0
-];
-let U16 = UInt [
-  mir_adt (UInt [
-    mir_adt U4,
-    mir_adt B0
-  ]),
-  mir_adt B0
-];
+let U = typenum_uint m;
 let GenericArray = mir_find_adt m "generic_array::GenericArray";
-let Block = GenericArray [mir_u8, mir_adt U16];
-let BatchBlocks = GenericArray [mir_adt Block, mir_adt U4];
+let Block = GenericArray [mir_u8, mir_adt (U 16)];
+let BatchBlocks = GenericArray [mir_adt Block, mir_adt (U 4)];
 
 // Spec for fixslice::bitslice, as used in aes{128,192,256}_{encrypt,decrypt}.
 let bitslice_cipher_spec = do {
