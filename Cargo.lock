@@ -3,6 +3,23 @@
 version = 4
 
 [[package]]
+name = "aes"
+version = "0.8.4"
+source = "git+https://github.com/RyanGlScott/block-ciphers.git?branch=backport-hybrid-arrays-to-aes-0.8.4#13b158c98807b0b468b0dde3742149ebc149a321"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures",
+]
+
+[[package]]
+name = "aes-verif"
+version = "0.1.0"
+dependencies = [
+ "aes",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "git+https://github.com/RyanGlScott/utils.git?branch=crucible-mir-patches#7e594dcbea1db2396d64fd97009165f97c0104c5"
@@ -15,6 +32,16 @@ name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[package]]
+name = "cipher"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
+dependencies = [
+ "crypto-common",
+ "inout",
+]
 
 [[package]]
 name = "cpufeatures"
@@ -55,6 +82,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "inout"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -75,6 +111,23 @@ name = "sha1-verif"
 version = "0.1.0"
 dependencies = [
  "sha1",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "git+https://github.com/RyanGlScott/hashes.git?branch=crucible-mir-patches#508540f19602c5eabfd3b05324024c9ee0c5042f"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
+name = "sha2-verif"
+version = "0.1.0"
+dependencies = [
+ "sha2",
 ]
 
 [[package]]

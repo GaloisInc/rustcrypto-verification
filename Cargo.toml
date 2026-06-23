@@ -1,0 +1,7 @@
+[workspace]
+resolver = "3"
+members = ["aes-verif", "sha1-verif", "sha2-verif"]
+
+[patch.crates-io]
+block-buffer = { git = "https://github.com/RyanGlScott/utils.git", package = "block-buffer", branch = "crucible-mir-patches" }
+generic-array = { git = "https://github.com/RyanGlScott/generic-array.git", branch = "backport-hybrid-arrays-to-generic-array-0.14.7" }
