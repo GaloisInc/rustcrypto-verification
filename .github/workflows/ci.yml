@@ -30,37 +30,24 @@ jobs:
       - run: rustc --version
       - run: cargo test
 
-  crux-test:
+  saw-verify:
     runs-on: ubuntu-latest
     needs: cargo-test
+    strategy:
+      matrix:
+        target: [verify-aes, verify-sha1, verify-sha2]
     container:
-      image: rust:1.87
-    env:
-      SAW_RUST_LIBRARY_PATH: ${{ github.workspace }}/saw-suite/rlibs
-      CRUX_RUST_LIBRARY_PATH: ${{ github.workspace }}/saw-suite/rlibs
-      CRYPTOLPATH: ${{ github.workspace }}/deps/cryptol-specs
+      image: ghcr.io/galoisinc/saw-suite:nightly
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
 
-      - name: Install jq
-        run: apt-get update && apt-get install -y jq
-
-      - name: Download saw-suite
-        env:
-          GITHUB_ACCESS_TOKEN: ${{ secrets.SAW_SUITE_TOKEN }}
-        run: ./.github/download_saw_suite.sh
-
       - name: Run SAW verification
         run: |
-          export PATH="$PWD/saw-suite/bin:$PATH"
-          echo "PATH=$PATH"
-          echo "SAW_RUST_LIBRARY_PATH=$SAW_RUST_LIBRARY_PATH"
-          echo "CRUX_RUST_LIBRARY_PATH=$CRUX_RUST_LIBRARY_PATH"
-          echo "CRYPTOLPATH=$CRYPTOLPATH"
           mir-json --version
           crux-mir --version
           saw --version
           cargo --version
           make clean
+          make ${{ matrix.target }}
