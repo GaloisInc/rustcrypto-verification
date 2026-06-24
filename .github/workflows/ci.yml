@@ -45,6 +45,7 @@ jobs:
 
       - name: Run SAW verification
         run: |
+          . "$HOME/.cargo/env"
           mir-json --version
           crux-mir --version
           saw --version
