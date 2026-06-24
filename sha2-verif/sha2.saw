@@ -30,7 +30,7 @@ SHA512Spec <- cryptol_load "Sha2Verif/Spec/SHA512.cry";
 // Note: platform-specific path to the mir-json output. You will have to change
 // this if not running on Mac.
 m <- mir_load_module
-    "target/aarch64-apple-darwin/debug/deps/sha2_verif-3c53f8139e44348c.linked-mir.json";
+    "../target/sha2_verif.linked-mir.json";
 
 // Lengths of the sample inputs to digest, from lib.rs. We will verify that
 // SHA-2 works correctly for inputs of both of these lengths.

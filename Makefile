@@ -1,11 +1,11 @@
 
-.PHONY: aes-verif sha1-verif sha2-verif
+.PHONY: verify-aes verify-sha1 verify-sha2
 
 clean:
 	cargo clean
 
 verify-aes: saw-build
-	CRYPTOLPATH=${CRYPTOLPATH} saw aws-verif/aes.saw
+	cd aes-verif && CRYPTOLPATH=${PWD}/../cryptol-specs saw aes.saw
 
 verify-sha1: saw-build
 	cd sha1-verif && CRYPTOLPATH=${PWD}/../cryptol-specs saw sha1.saw

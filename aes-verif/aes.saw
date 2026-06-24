@@ -23,7 +23,7 @@ KeySchedule256 <- cryptol_load "AesVerif/KeySchedule256.cry";
 // Note: platform-specific path to the mir-json output. You will have to change
 // this if not running on Mac.
 m <- mir_load_module
-  "target/aarch64-apple-darwin/debug/deps/aes_verif-a7726c0105e8b76e.linked-mir.json";
+  "../target/aes_verif.linked-mir.json";
 
 // Rust types used by functions in the aes crate.
 let U = typenum_uint m;
