@@ -49,5 +49,4 @@ jobs:
           crux-mir --version
           saw --version
           cargo --version
-          make clean
           make ${{ matrix.target }}

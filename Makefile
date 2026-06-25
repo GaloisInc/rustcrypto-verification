@@ -5,13 +5,13 @@ clean:
 	cargo clean
 
 verify-aes: saw-build
-	cd aes-verif && CRYPTOLPATH=${PWD}/../cryptol-specs saw aes.saw
+	cd aes-verif && CRYPTOLPATH=../cryptol-specs saw aes.saw
 
 verify-sha1: saw-build
-	cd sha1-verif && CRYPTOLPATH=${PWD}/../cryptol-specs saw sha1.saw
+	cd sha1-verif && CRYPTOLPATH=../cryptol-specs saw sha1.saw
 
 verify-sha2: saw-build
-	cd sha2-verif && CRYPTOLPATH=${PWD}/../cryptol-specs saw sha2.saw
+	cd sha2-verif && CRYPTOLPATH=../cryptol-specs saw sha2.saw
 
 saw-build:
 	RUSTFLAGS="--cfg aes_force_soft" cargo saw-build
