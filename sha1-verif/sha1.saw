@@ -2,8 +2,7 @@ include_once "../utils/typenum.saw";
 
 import Primitive::Keyless::Hash::SHA1::Specification as SHA1;
 
-m <- mir_load_module
-    "../target/sha1_verif.linked-mir.json";
+m <- mir_load_module "../target/sha1_verif.linked-mir.json";
 
 let U = typenum_uint m;
 let GenericArray = mir_find_adt m "generic_array::GenericArray";
