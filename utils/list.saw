@@ -1,0 +1,6 @@
+// Flatten a nested list.
+rec concats (xss : [[a]]) : [a] =
+  if null xss then
+    []
+  else
+    concat (head xss) (concats (tail xss));

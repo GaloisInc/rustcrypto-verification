@@ -17,11 +17,14 @@ So instead they are defined separately for each key size, in
 `AesVerif::KeySchedule{128,192,256}`, in a more unrolled fashion.
 
 Naming conventions: Specifications for Rust functions are named exactly the same
-as the Rust function (`lower_snake_case`). Functions that operate on `State` as
-defined in `cryptol-specs` are in `UpperCamelCase`, like the ones in
-`cryptol-specs` itself (which in turn are named identically to the functions in
-the official AES spec). Other auxiliary functions are mostly `lowerCamelCase`
-like normal Cryptol functions.
+as the Rust function (`lower_snake_case`). For families of functions which are
+defined as separate Rust functions for each key size but have a single
+parameterized specification defined in this module, the specification is named
+using the common part of the Rust function names (omitting the key size part).
+Functions that operate on `State` as defined in `cryptol-specs` are in
+`UpperCamelCase`, like the ones in `cryptol-specs` itself (which in turn are
+named identically to the functions in the official AES spec). Other auxiliary
+functions are mostly `lowerCamelCase` like normal Cryptol functions.
 */
 module AesVerif::Parameterized where
 
@@ -119,8 +122,10 @@ SubBytesNots state = [[b ^ 0x63 | b <- row] | row <- state]
 Specification for the `fixslice::sub_bytes_nots` function. This is only used in
 the key schedule functions, so we define it directly on the fixsliced format (as
 opposed to in terms of `SubBytesNots`) to make it easier for the solver. The
-equivalence to `SubBytesNots` is proven later, using SAW rewrite theorems
-instead of compositional overrides.
+equivalence to `SubBytesNots` is proven indirectly later on, when we do the SAW
+proof for the toplevel encrypt and decrypt functions, because those need to
+match up the sub_bytes_nots in the key schedule with the SubBytesNots coming
+from invBitsliceAdjustKeySchedule.
 */
 sub_bytes_nots : FSState -> FSState
 sub_bytes_nots [s0, s1, s2, s3, s4, s5, s6, s7] =
@@ -292,15 +297,74 @@ inv_shift_rows_3 : FSState -> FSState
 inv_shift_rows_3 = shift_rows_1
 
 /**
-Specification for the `aes_verif::encrypt{128,192,256}` function corresponding
-to the key size.
+Specification for the `fixslice::aes{128,192,256}_encrypt` function
+corresponding to the key size.
 */
-encrypt : KeyBytes -> BlockBytes -> BlockBytes
-encrypt key block = split (Spec::encrypt (join key) (join block))
+aes_encrypt : FSRoundKeys -> BatchBlockBytes -> BatchBlockBytes
+aes_encrypt = bitslicedKeyCipher Spec::cipher
 
 /**
-Specification for the `aes_verif::decrypt{128,192,256}` function corresponding
-to the key size.
+Specification for the `fixslice::aes{128,192,256}_decrypt` function
+corresponding to the key size.
 */
-decrypt : KeyBytes -> BlockBytes -> BlockBytes
-decrypt key block = split (Spec::decrypt (join key) (join block))
+aes_decrypt : FSRoundKeys -> BatchBlockBytes -> BatchBlockBytes
+aes_decrypt = bitslicedKeyCipher Spec::invCipher
+
+/**
+Given a cipher function from `cryptol-specs`, return a version of it that
+operates on a bitsliced key schedule and non-bitsliced batch input.
+*/
+bitslicedKeyCipher
+   : (Spec::KeySchedule -> [Spec::BlockSize] -> [Spec::BlockSize])
+  -> FSRoundKeys -> BatchBlockBytes -> BatchBlockBytes
+bitslicedKeyCipher cipher rkeys blocks =
+  [ split (cipher keySchedule (join block))
+  | keySchedule <- invBitsliceAdjustKeySchedule rkeys
+  | block <- blocks
+  ]
+
+/**
+Given a bitsliced and adjusted key schedule, as produced by
+`fixslice::aes{128,192,256}_key_schedule`, undo the bitslicing and adjustments
+to yield the key schedule as defined in the AES spec.
+*/
+invBitsliceAdjustKeySchedule : FSRoundKeys -> Batch Spec::KeySchedule
+invBitsliceAdjustKeySchedule fsRoundKeys =
+  transpose
+    [ [transpose (split rk) | rk <- inv_bitslice (f (g w))]
+    | f <- take`{Spec::Nr} shiftRowFns # [id]
+    | g <- [id] # repeat`{Spec::Nr} sub_bytes_nots
+    | w <- split fsRoundKeys
+    ]
+  where
+    shiftRowFns = cycle [id, shift_rows_1, shift_rows_2, shift_rows_3]
+
+private
+
+  id : {a} a -> a
+  id x = x
+
+  cycle : {n, a} (fin n) => [n]a -> [inf]a
+  cycle xs = xs # cycle xs
+
+/**
+Specification for the `aes_verif::toplevel_encrypt_block_{128,192,256}`
+function.
+*/
+toplevel_encrypt_block : KeyBytes -> BlockBytes -> BlockBytes
+toplevel_encrypt_block = byteCrypt Spec::encrypt
+
+/**
+Specification for the `aes_verif::toplevel_decrypt_block_{128,192,256}`
+function.
+*/
+toplevel_decrypt_block : KeyBytes -> BlockBytes -> BlockBytes
+toplevel_decrypt_block = byteCrypt Spec::decrypt
+
+/**
+Given an encrypt/decrypt function from `cryptol-specs`, return a version of it
+that operates on bytes.
+*/
+byteCrypt : ([Spec::KeySize] -> [Spec::BlockSize] -> [Spec::BlockSize])
+         -> KeyBytes -> BlockBytes -> BlockBytes
+byteCrypt crypt key block = split (crypt (join key) (join block))

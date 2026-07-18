@@ -11,9 +11,14 @@ A single AES block, as a byte array. Corresponds to `aes::Block`.
 type BlockBytes = [16][8]
 
 /**
+For 64-bit bitsliced AES, the batch size is 4.
+*/
+type Batch a = [4]a
+
+/**
 An array of 4 blocks. Corresponds to `fixslice::BatchBlocks`.
 */
-type BatchBlockBytes = [4]BlockBytes
+type BatchBlockBytes = Batch BlockBytes
 
 /**
 Fixsliced form of 4 AES blocks. Corresponds to `fixslice::State`.
