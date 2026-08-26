@@ -35,7 +35,7 @@ jobs:
     needs: cargo-test
     strategy:
       matrix:
-        target: [verify-aes, verify-sha1, verify-sha2]
+        target: [verify-aes, verify-sha1, verify-sha2, verify-aes-gcm]
     container:
       image: ghcr.io/galoisinc/saw-suite:nightly
     steps:
