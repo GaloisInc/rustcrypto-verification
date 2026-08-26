@@ -5,10 +5,10 @@ clean:
 	cargo clean
 
 verify-aes: saw-build
-	cd aes-verif && CRYPTOLPATH=../cryptol-specs saw aes.saw
+	cd aes-verif && CRYPTOLPATH=../cryptol-specs saw aes-run.saw
 
 verify-aes-gcm: saw-build
-	cd aes-gcm-verif && CRYPTOLPATH=../cryptol-specs saw aes-gcm.saw
+	cd aes-gcm-verif && CRYPTOLPATH="../cryptol-specs:../aes-verif" saw aes-gcm.saw
 
 verify-sha1: saw-build
 	cd sha1-verif && CRYPTOLPATH=../cryptol-specs saw sha1.saw
