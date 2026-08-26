@@ -1,0 +1,295 @@
+enable_experimental;
+
+// include_once "../utils/typenum.saw";
+
+include_once "../aes-verif/aes-lib.saw";
+
+import AesGcmVerif::Spec::Aes128_GCM as Aes128_GCM;
+
+import AesGcmVerif::Spec::AES_GCM_SIV_Polyval as Polyval (dot, mult, byteSwap);
+
+m <- mir_load_module "../target/aes_gcm_verif.linked-mir.json";
+
+aes <- aes_setup m unsafe_assume=true;
+aes128_key_schedule_ov <- aes.aes128.verify_key_schedule;
+aes128_encipher_ov <- aes.aes128.verify_encipher;
+
+let U = typenum_uint m;
+let GenericArray = mir_find_adt m "generic_array::GenericArray";
+let Key = GenericArray [mir_u8, mir_adt (U 16)];
+let PolyvalBlock = GenericArray [mir_u8, mir_adt (U 16)];
+let PhantomData = mir_find_adt m "core::marker::PhantomData";
+let AeadError = mir_find_adt m "aead::Error" [];
+let AeadResult t = mir_find_adt m "core::result::Result" [t, mir_adt AeadError];
+
+let Aes128Rust = mir_find_adt m "aes::soft::Aes128" [];
+let GHash = mir_find_adt m "ghash::GHash" [];
+let Polyval = mir_find_adt m "polyval::backend::soft::Polyval" [];
+let U64x2 = mir_find_adt m "polyval::backend::soft::U64x2" [];
+
+let {{
+    type CryPoly = [128]
+    type PolyvalPoly = [16][8]
+    type U64x2 = [2][64]
+
+    polyvalToCry : PolyvalPoly -> CryPoly
+    polyvalToCry p = join (reverse p)
+
+    cryToPolyval : CryPoly -> PolyvalPoly
+    cryToPolyval p = reverse (split p)
+
+    polyvalToU64x2 : PolyvalPoly -> U64x2
+    polyvalToU64x2 p = [join (reverse half) | half <- split`{2} p]
+
+    cryToU64x2 : CryPoly -> U64x2
+    cryToU64x2 (p1 # p0) = [p0, p1]
+
+    u64x2ToCry : U64x2 -> CryPoly
+    u64x2ToCry [p0, p1] = p1 # p0
+
+    polyvalMulX : CryPoly -> CryPoly
+    polyvalMulX h = Polyval::mult h <| x |>
+
+    polyvalDot : U64x2 -> U64x2 -> U64x2
+    polyvalDot a b = cryToU64x2 (Polyval::dot (u64x2ToCry a) (u64x2ToCry b))
+
+    polyvalIter : U64x2 -> U64x2 -> PolyvalPoly -> U64x2
+    polyvalIter h s x =
+        cryToU64x2
+            (Polyval::dot ((u64x2ToCry s) ^ (polyvalToCry x)) (u64x2ToCry h))
+}};
+
+thm_u64x2ToCry_cryToU64x2 <- prove_print z3 {{
+    \p -> u64x2ToCry (cryToU64x2 p) == p
+}};
+
+thm_polyval_dot_mulx_as_ghash_dot <- prove_print rme {{
+    \a h -> Polyval::dot a (polyvalMulX h) == a Aes128_GCM::Spec::• h
+}};
+
+thm_u64x2ToCry_hmm <- prove_core z3 "(x : seq (TCNum 64) Bool) -> EqTrue (ecEq (seq (TCNum 128) Bool) (PEqSeqBool (TCNum 128)) (u64x2ToCry [x, x]) (append 64 64 Bool x x))";
+
+thm_single_ghash <- prove_core (unint_z3 ["Aes128_GCM::Spec::•"])
+    "(h : seq (TCNum 128) Bool) -> (x : seq (TCNum 128) Bool) -> EqTrue (ecEq (seq (TCNum 128) Bool) (PEqSeqBool (TCNum 128)) (!?\"•\" (ecXor (seq (TCNum 128) Bool) (PLogicSeqBool (TCNum 128)) (u64x2ToCry [bvNat 64 0, bvNat 64 0]) x) h) (GHASH (TCNum 1) h x))";
+
+thm_ghash_single <- prove_core (unint_z3 ["Aes128_GCM::Spec::•"])
+    "(h : seq (TCNum 128) Bool) -> (x : seq (TCNum 128) Bool) -> EqTrue (ecEq (seq (TCNum 128) Bool) (PEqSeqBool (TCNum 128)) (!?\"•\" (ecXor (seq (TCNum 128) Bool) (PLogicSeqBool (TCNum 128)) (append 64 64 Bool (bvNat 64 0) (bvNat 64 0)) x) h) (GHASH (TCNum 1) h x))";
+
+thms_ghash_fold <-
+    for (map eval_int (eval_list {{ [1..6 : [64]] }})) (\n -> do {
+        prove_print (unint_z3 ["Aes128_GCM::Spec::•"]) {{
+            \h x xs ->
+                (Aes128_GCM::Spec::GHASH`{n} h xs ^ x) Aes128_GCM::Spec::• h
+                == Aes128_GCM::Spec::GHASH h (xs # x)
+        }};
+    });
+
+let polyval_mulx_spec = do {
+    v <- mir_fresh_var "v" (mir_array 16 mir_u8);
+    block <- mir_ref_of (mir_struct_value PolyvalBlock [mir_term v]);
+
+    mir_execute_func [block];
+
+    mir_return (mir_struct_value PolyvalBlock [
+        mir_term {{ cryToPolyval (polyvalMulX (polyvalToCry v)) }}
+    ]);
+};
+
+polyval_mulx_ov <- mir_verify m "polyval::mulx::mulx" [] false polyval_mulx_spec rme;
+
+let polyval_bmul64_spec = do {
+    x <- mir_fresh_var "x" mir_u64;
+    y <- mir_fresh_var "y" mir_u64;
+
+    mir_execute_func [mir_term x, mir_term y];
+
+    mir_return (mir_term {{ drop (pmult x y) : [64] }});
+};
+
+polyval_bmul64_ov <- mir_verify m "polyval::backend::soft::bmul64" [] false polyval_bmul64_spec rme;
+
+let polyval_rev64_spec = do {
+    x <- mir_fresh_var "x" mir_u64;
+
+    mir_execute_func [mir_term x];
+
+    mir_return (mir_term {{ reverse x }});
+};
+
+polyval_rev64_ov <- mir_verify m "polyval::backend::soft::rev64" [] false polyval_rev64_spec z3;
+
+let mk_U64x2 (p : Term /* [2][64] */) =
+    mir_struct_value U64x2 (map mir_term (eval_list p));
+
+let polyval_dot_spec = do {
+    self0 <- mir_fresh_var "self0" mir_u64;
+    self1 <- mir_fresh_var "self1" mir_u64;
+    rhs0 <- mir_fresh_var "rhs0" mir_u64;
+    rhs1 <- mir_fresh_var "rhs1" mir_u64;
+
+    mir_execute_func [
+        mir_struct_value U64x2 [mir_term self0, mir_term self1],
+        mir_struct_value U64x2 [mir_term rhs0, mir_term rhs1]
+    ];
+
+    mir_return (mk_U64x2 {{ polyvalDot [self0, self1] [rhs0, rhs1] }});
+};
+
+polyval_dot_ov <- mir_verify m "polyval::backend::soft::{impl#11}::mul" [polyval_bmul64_ov, polyval_rev64_ov] false polyval_dot_spec rme;
+
+let polyval_proc_block_spec = do {
+    h0 <- mir_fresh_var "h0" mir_u64;
+    h1 <- mir_fresh_var "h1" mir_u64;
+    s0 <- mir_fresh_var "s0" mir_u64;
+    s1 <- mir_fresh_var "s1" mir_u64;
+    x <- mir_fresh_var "x" (mir_array 16 mir_u8);
+    self_ref <- mir_ref_of_mut (mir_struct_value Polyval [
+        mir_struct_value U64x2 [mir_term h0, mir_term h1],
+        mir_struct_value U64x2 [mir_term s0, mir_term s1]
+    ]);
+    x_block <- mir_ref_of (mir_struct_value PolyvalBlock [mir_term x]);
+    mir_execute_func [self_ref, x_block];
+    mir_points_to self_ref (mir_struct_value Polyval [
+        mir_struct_value U64x2 [mir_term h0, mir_term h1],
+        mk_U64x2 {{ polyvalIter [h0, h1] [s0, s1] x }}
+    ]);
+};
+
+polyval_proc_block_ov <- mir_verify m "polyval::backend::soft::{impl#5}::proc_block" [polyval_dot_ov] false polyval_proc_block_spec rme;
+
+let Aes128Gcm = mir_find_adt m "aes_gcm::AesGcm" [
+    mir_adt Aes128Rust,
+    mir_adt (U 12),
+    mir_adt (U 16)
+];
+
+let mk_Aes128 (k : Term /* [16][8] */) =
+    let fs_keys = {{ AesKeySchedule128::key_schedule k }} in
+    let h = {{ polyvalMulX (Aes128::Spec::encrypt (join k) 0) }} in
+    mir_struct_value Aes128Gcm [
+        mir_struct_value Aes128Rust [
+            mir_term fs_keys
+        ],
+        mir_struct_value GHash [
+            mir_struct_value Polyval [
+                mk_U64x2 {{ cryToU64x2 h }},
+                mk_U64x2 {{ zero : [2][64] }}
+            ]
+        ],
+        mir_struct_value (PhantomData [mir_adt (U 12)]) [],
+        mir_struct_value (PhantomData [mir_adt (U 16)]) []
+    ];
+
+let Aes128Gcm_new_spec = do {
+    k <- mir_fresh_var "k" (mir_array 16 mir_u8);
+    key <- mir_ref_of (mir_struct_value Key [mir_term k]);
+
+    mir_execute_func [key];
+
+    mir_return (mk_Aes128 k);
+};
+
+let Aes128Gcm_new_id = mir_find_name m "aes_gcm::{impl#2}::new" [
+    mir_adt Aes128Rust,
+    mir_adt (U 12),
+    mir_adt (U 16)
+];
+mir_verify m Aes128Gcm_new_id [aes128_key_schedule_ov, aes128_encipher_ov, polyval_mulx_ov] false Aes128Gcm_new_spec
+    (unint_z3 ["keyExpansion", "cipher", "polyvalMulX"]);
+
+thm_Vec_lit_of_ats <- prove_core z3
+    "(v : Vec 2 (seq (TCNum 64) Bool)) -> EqTrue (vecEq 2 (seq (TCNum 64) Bool) (bvEq 64) [at 2 (seq (TCNum 64) Bool) v 0, at 2 (seq (TCNum 64) Bool) v 1] v)";
+
+let Aes128Gcm_encrypt_in_place_detached_spec p_byte_len aad_byte_len = do {
+    k <- mir_fresh_var "k" (mir_array 16 mir_u8);
+    iv <- mir_fresh_var "iv" (mir_array 12 mir_u8);
+    p <- mir_fresh_var "p" (mir_array p_byte_len mir_u8);
+    aad <- mir_fresh_var "a" (mir_array aad_byte_len mir_u8);
+
+    self <- mir_ref_of (mk_Aes128 k);
+    nonce <- mir_ref_of (mir_struct_value (GenericArray [mir_u8, mir_adt (U 12)]) [mir_term iv]);
+    associated_data <- mir_ref_of (mir_term aad);
+    buffer <- mir_ref_of_mut (mir_term p);
+
+    mir_execute_func [self, nonce, mir_slice_value associated_data, mir_slice_value buffer];
+
+    let c_t = {{ Aes128_GCM::Spec::GCM_AE`{T=128} (join k) (join iv) (join p) (join aad) }};
+
+    mir_points_to buffer (mir_term {{ split`{each=8} c_t.0 }});
+    mir_return (mir_enum_value (AeadResult (mir_adt (GenericArray [mir_u8, mir_adt (U 16)]))) "Ok" [
+        mir_struct_value (GenericArray [mir_u8, mir_adt (U 16)]) [
+            mir_term {{ split`{each=8} c_t.1 }}
+        ]
+    ]);
+};
+
+let Aes128Gcm_encrypt_in_place_detached_id = mir_find_name m "aes_gcm::{impl#5}::encrypt_in_place_detached" [
+    mir_adt Aes128Rust,
+    mir_adt (U 12),
+    mir_adt (U 16)
+];
+mir_verify m Aes128Gcm_encrypt_in_place_detached_id [aes128_encipher_ov, polyval_proc_block_ov] false (Aes128Gcm_encrypt_in_place_detached_spec 40 40) do {
+    unfolding ["polyvalIter"];
+
+    simplify
+        (addsimps thms_ghash_fold
+            (addsimps [
+                thm_Vec_lit_of_ats,
+                thm_u64x2ToCry_cryToU64x2,
+                thm_polyval_dot_mulx_as_ghash_dot,
+                thm_u64x2ToCry_hmm,
+                thm_ghash_single
+            ] empty_ss));
+
+    unint_z3 ["keyExpansion", "cipher", "GHASH"];
+};
+
+let Aes128Gcm_decrypt_in_place_detached_spec c_byte_len aad_byte_len = do {
+    k <- mir_fresh_var "k" (mir_array 16 mir_u8);
+    iv <- mir_fresh_var "iv" (mir_array 12 mir_u8);
+    c <- mir_fresh_var "c" (mir_array c_byte_len mir_u8);
+    aad <- mir_fresh_var "a" (mir_array aad_byte_len mir_u8);
+    t <- mir_fresh_var "t" (mir_array 16 mir_u8);
+
+    self <- mir_ref_of (mk_Aes128 k);
+    nonce <- mir_ref_of (mir_struct_value (GenericArray [mir_u8, mir_adt (U 12)]) [mir_term iv]);
+    associated_data <- mir_ref_of (mir_term aad);
+    buffer <- mir_ref_of_mut (mir_term c);
+    tag <- mir_ref_of (mir_struct_value (GenericArray [mir_u8, mir_adt (U 16)]) [mir_term t]);
+
+    mir_execute_func [self, nonce, mir_slice_value associated_data, mir_slice_value buffer, tag];
+
+    let r = {{ Aes128_GCM::Spec::GCM_AD (join k) (join iv) (join c) (join aad) (join t) }};
+
+    mir_points_to buffer (mir_term {{
+        case r of
+            Some p -> split`{each=8} p
+            None -> c
+    }});
+
+    mir_return
+        (mir_mux_values {{ case r of Some _ -> True; None -> False }}
+            (mir_enum_value (AeadResult (mir_tuple [])) "Ok" [mir_tuple_value []])
+            (mir_enum_value (AeadResult (mir_tuple [])) "Err" [mir_struct_value AeadError []]));
+};
+
+let Aes128Gcm_decrypt_in_place_detached_id = mir_find_name m "aes_gcm::{impl#5}::decrypt_in_place_detached" [
+    mir_adt Aes128Rust,
+    mir_adt (U 12),
+    mir_adt (U 16)
+];
+mir_verify m Aes128Gcm_decrypt_in_place_detached_id [aes128_encipher_ov, polyval_proc_block_ov] false (Aes128Gcm_decrypt_in_place_detached_spec 40 40) do {
+    unfolding ["polyvalIter"];
+
+    simplify
+        (addsimps thms_ghash_fold
+            (addsimps [
+                thm_Vec_lit_of_ats,
+                thm_u64x2ToCry_cryToU64x2,
+                thm_polyval_dot_mulx_as_ghash_dot,
+                thm_u64x2ToCry_hmm,
+                thm_ghash_single
+            ] empty_ss));
+
+    unint_z3 ["keyExpansion", "cipher", "GHASH"];
+};

@@ -1,0 +1,3 @@
+module AesGcmVerif::Spec::AES_GCM_SIV_Polyval = Primitive::Symmetric::Cipher::Authenticated::AES_GCM_SIV where
+  type KeySize = 128
+  type AAD = 0

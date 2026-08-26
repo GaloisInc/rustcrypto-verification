@@ -1,7 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["aes-verif", "sha1-verif", "sha2-verif"]
+members = ["aes-verif", "aes-gcm-verif", "sha1-verif", "sha2-verif"]
 
 [patch.crates-io]
+aes = { git = "https://github.com/RyanGlScott/block-ciphers.git", branch = "backport-hybrid-arrays-to-aes-0.8.4" }
 block-buffer = { git = "https://github.com/RyanGlScott/utils.git", package = "block-buffer", branch = "crucible-mir-patches" }
 generic-array = { git = "https://github.com/RyanGlScott/generic-array.git", branch = "backport-hybrid-arrays-to-generic-array-0.14.7" }

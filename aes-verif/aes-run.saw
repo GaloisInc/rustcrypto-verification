@@ -1,0 +1,42 @@
+include_once "aes-lib.saw";
+
+m <- mir_load_module "../target/aes_verif.linked-mir.json";
+
+aes <- aes_setup m;
+
+for [aes.aes128, aes.aes192, aes.aes256] (\(size : AesSize) -> do {
+  let Aes = size.Aes;
+
+  key_schedule_ov <- size.verify_key_schedule;
+  encipher_ov <- size.verify_encipher;
+
+  // Spec for aes_verif::toplevel_{encrypt,decrypt}_block_{128,192,256}, where
+  // toplevel_crypt is either Aes::toplevel_encrypt_block or
+  // Aes::toplevel_decrypt_block.
+  let toplevel_crypt_spec
+      (toplevel_crypt : Term /* KeyBytes -> BlockBytes -> BlockBytes */)
+  = do {
+    key <- mir_fresh_cryptol_var "key" {| Aes::KeyBytes |};
+    block <- mir_fresh_cryptol_var "block" {| AesBitslice::BlockBytes |};
+    mir_execute_func [mir_term key, mir_term block];
+    mir_return (mir_term {{ toplevel_crypt key block }});
+  };
+
+  // Verify aes_verif::toplevel_encrypt_block_{128,192,256}.
+  mir_verify m
+    (str_concat "aes_verif::toplevel_encrypt_block_" size.key_size_str)
+    [key_schedule_ov, encipher_ov]
+    false
+    (toplevel_crypt_spec {{ Aes::toplevel_encrypt_block }})
+    (unint_z3 ["keyExpansion", "cipher"]);
+
+  decipher_ov <- size.verify_decipher;
+
+  // Verify aes_verif::toplevel_decrypt_block_{128,192,256}.
+  mir_verify m
+    (str_concat "aes_verif::toplevel_decrypt_block_" size.key_size_str)
+    [key_schedule_ov, decipher_ov]
+    false
+    (toplevel_crypt_spec {{ Aes::toplevel_decrypt_block }})
+    (unint_z3 ["keyExpansion", "invCipher"]);
+});

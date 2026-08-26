@@ -1,0 +1,2689 @@
+// Verification of key expansion, encipher, and decipher operations using the
+// Rust aes crate against the cryptol-specs specification, for all three key
+// sizes of AES.
+
+// We want to use the SAW code in this file both for verifying AES itself and as
+// part of AES-GCM verification, so this file is meant to be `include_once`d
+// from the "main" SAW script. As such, the only definitions introduced into the
+// top level scope are several typedefs and Cryptol modules (which need to be at
+// the top level) and the aes_setup function, which returns the actual AES
+// verification operations for a given MIR module.
+
+enable_experimental;
+
+include_once "../utils/list.saw";
+include_once "../utils/typenum.saw";
+
+AesBitslice <- cryptol_load "AesVerif/Bitslice.cry";
+AesProofUtils <- cryptol_load "AesVerif/ProofUtils.cry";
+
+Aes128 <- cryptol_load "AesVerif/Aes128.cry";
+AesKeySchedule128 <- cryptol_load "AesVerif/KeySchedule128.cry";
+
+Aes192 <- cryptol_load "AesVerif/Aes192.cry";
+AesKeySchedule192 <- cryptol_load "AesVerif/KeySchedule192.cry";
+
+Aes256 <- cryptol_load "AesVerif/Aes256.cry";
+AesKeySchedule256 <- cryptol_load "AesVerif/KeySchedule256.cry";
+
+typedef AesSize = {
+  // The Aes{128,192,256} module for this key size.
+  Aes : CryptolModule,
+  // The KeySchedule{128,192,256} module for this key size.
+  KeySchedule : CryptolModule,
+  key_size_str : String,
+  verify_key_schedule : TopLevel MIRSpec,
+  verify_encipher : TopLevel MIRSpec,
+  verify_decipher : TopLevel MIRSpec
+};
+
+typedef AesVerification = {
+  aes128 : AesSize,
+  aes192 : AesSize,
+  aes256 : AesSize
+};
+
+let aes_setup
+    (m : MIRModule)
+    (unsafe_assume?=false : Bool)
+    : TopLevel AesVerification
+= do {
+  let Bitslice = AesBitslice;
+  let ProofUtils = AesProofUtils;
+
+  let verify f ovs path_sat spec proof =
+    if unsafe_assume
+      then mir_unsafe_assume_spec m f spec
+      else mir_verify m f ovs path_sat spec proof;
+
+  let prove' proof =
+    prove_print
+      (if unsafe_assume
+        then admit "unsafe_assume enabled for aes_setup"
+        else proof);
+
+  // Rust types used by functions in the aes crate.
+  let U = typenum_uint m;
+  let GenericArray = mir_find_adt m "generic_array::GenericArray";
+  let Block = GenericArray [mir_u8, mir_adt (U 16)];
+  let BatchBlocks = GenericArray [mir_adt Block, mir_adt (U 4)];
+
+  // Spec for fixslice::bitslice, as used in aes{128,192,256}_{encrypt,decrypt}.
+  let bitslice_cipher_spec = do {
+    output_init <- mir_fresh_cryptol_var "output_init" {| Bitslice::FSState |};
+    output_ref <- mir_ref_of_mut (mir_term output_init);
+    block0 <- mir_fresh_cryptol_var "block0" {| Bitslice::BlockBytes |};
+    block1 <- mir_fresh_cryptol_var "block1" {| Bitslice::BlockBytes |};
+    block2 <- mir_fresh_cryptol_var "block2" {| Bitslice::BlockBytes |};
+    block3 <- mir_fresh_cryptol_var "block3" {| Bitslice::BlockBytes |};
+    blocks_ref <- mir_ref_of (mir_array_value (mir_adt Block) [
+      mir_struct_value Block [mir_term block0],
+      mir_struct_value Block [mir_term block1],
+      mir_struct_value Block [mir_term block2],
+      mir_struct_value Block [mir_term block3]
+    ]);
+    mir_execute_func [
+      mir_slice_value output_ref,
+      mir_slice_value (mir_field_ref (mir_elem_ref blocks_ref 0) "data"),
+      mir_slice_value (mir_field_ref (mir_elem_ref blocks_ref 1) "data"),
+      mir_slice_value (mir_field_ref (mir_elem_ref blocks_ref 2) "data"),
+      mir_slice_value (mir_field_ref (mir_elem_ref blocks_ref 3) "data")
+    ];
+    mir_points_to output_ref (mir_term {{
+      Bitslice::bitslice [block0, block1, block2, block3]
+    }});
+  };
+
+  bitslice_cipher_ov <-
+    verify "aes::soft::fixslice::bitslice" [] false
+      bitslice_cipher_spec rme;
+
+  // Spec for fixslice::inv_bitslice.
+  let inv_bitslice_spec = do {
+    input <- mir_fresh_cryptol_var "input" {| Bitslice::FSState |};
+    input_ref <- mir_ref_of (mir_term input);
+    mir_execute_func [mir_slice_value input_ref];
+    let output = {{ Bitslice::inv_bitslice input }};
+    mir_return (mir_struct_value BatchBlocks [
+      mir_array_value (mir_adt Block) [
+        mir_struct_value Block [mir_term {{ output @ 0 }}],
+        mir_struct_value Block [mir_term {{ output @ 1 }}],
+        mir_struct_value Block [mir_term {{ output @ 2 }}],
+        mir_struct_value Block [mir_term {{ output @ 3 }}]
+      ]
+    ]);
+  };
+
+  inv_bitslice_ov <-
+    verify "aes::soft::fixslice::inv_bitslice" [] false
+      inv_bitslice_spec rme;
+
+  // Rewrite rule to cancel out inv_bitslice of bitslice.
+  thm_inv_bitslice_bitslice <- prove' rme {{
+    \x -> Bitslice::inv_bitslice (Bitslice::bitslice x) == x
+  }};
+
+  // Spec for functions which take a State by mutable reference and mutate it
+  // according to the given Cryptol function.
+  let mutate_state_ref_spec (cry_fun : Term /* FSState -> FSState */) = do {
+    state_init <- mir_fresh_cryptol_var "state_init" {| Bitslice::FSState |};
+    state_ref <- mir_ref_of_mut (mir_term state_init);
+    mir_execute_func [state_ref];
+    mir_points_to state_ref (mir_term {{ cry_fun state_init }});
+  };
+
+  // Spec for functions which take a State as a mutable slice and mutate it
+  // according to the given Cryptol function.
+  let mutate_state_slice_spec (cry_fun : Term /* FSState -> FSState */) = do {
+    state_init <- mir_fresh_cryptol_var "state_init" {| Bitslice::FSState |};
+    state_ref <- mir_ref_of_mut (mir_term state_init);
+    mir_execute_func [mir_slice_value state_ref];
+    mir_points_to state_ref (mir_term {{ cry_fun state_init }});
+  };
+
+  // Given a reference to an array of bitsliced round keys, return a slice of the
+  // round key for the given round (starting from 0).
+  let slice_round (round : Int) (arr_ref : MIRValue) : MIRValue =
+    mir_slice_range_value arr_ref
+      (eval_size {| round * 8 |})
+      (eval_size {| (round + 1) * 8 |});
+
+  let mk_aes_size
+      (Aes : CryptolModule)
+      (KeySchedule : CryptolModule)
+      (bitslice_key_ovs : [MIRSpec])
+      (key_schedule_proof : ProofScript ())
+      : TopLevel AesSize
+  = do {
+    // Key size as a string.
+    let key_size_str = show {| Aes::Spec::KeySize |};
+
+    // Integers from 0 through the number of rounds, inclusive, which can be used
+    // as indices into the bitsliced round keys array with slice_round and
+    // sliceRound/modifyRound. Note that the length of this list is one more than
+    // the number of rounds.
+    let rounds = map eval_int (eval_list {{ [0..Aes::Spec::Nr : [64]] }});
+
+    // Override for fixslice::sub_bytes, as used in
+    // aes{128,192,256}_{encrypt_decrypt} and aes192_key_schedule.
+    sub_bytes_cipher_ov <-
+      verify "aes::soft::fixslice::sub_bytes" [] false
+        (mutate_state_slice_spec {{ Aes::sub_bytes }}) rme;
+
+    // Override for fixslice::sub_bytes_nots, as used in aes192_key_schedule
+    // inside the main loop, when it is called on a slice of tmp: [u64; 8].
+    sub_bytes_nots_tmp_ov <-
+      verify "aes::soft::fixslice::sub_bytes_nots" [] false
+        (mutate_state_slice_spec {{ Aes::sub_bytes_nots }}) rme;
+
+    // Override for fixslice::shift_rows_2, as used in aes{128,256}_encrypt.
+    shift_rows_2_ov <-
+      verify "aes::soft::fixslice::shift_rows_2" [] false
+        (mutate_state_slice_spec {{ Aes::shift_rows_2 }}) rme;
+
+    let verify_key_schedule = do {
+      // Spec for functions which take a mutable slice of a round key from the
+      // bitsliced round keys array and mutate it according to the given Cryptol
+      // function.
+      let mutate_rkeys_slice_spec
+          (round : Int)
+          (cry_fun : Term /* FSState -> FSState */)
+      = do {
+        rkeys_init <- mir_fresh_cryptol_var "rkeys_init" {| Aes::FSRoundKeys |};
+        rkeys_ref <- mir_ref_of_mut (mir_term rkeys_init);
+        mir_execute_func [slice_round round rkeys_ref];
+        mir_points_to rkeys_ref (mir_term {{
+          ProofUtils::modifyRound`{round} cry_fun rkeys_init
+        }});
+      };
+
+      // Verify a function which takes a mutable slice of a round key from the
+      // bitsliced round keys array and mutates it according to the given Cryptol
+      // function, and obtain overrides for it for all round keys in the bitsliced
+      // round key array.
+      let verify_mutate_rkeys_slice
+          (rust_fun : String)
+          (cry_fun : Term /* FSState -> FSState */)
+          : TopLevel [MIRSpec]
+      = do {
+        for rounds (\i -> do {
+          verify rust_fun [] false (mutate_rkeys_slice_spec i cry_fun) rme;
+        });
+      };
+
+      // Overrides for fixslice::sub_bytes, as used in aes{128,256}_key_schedule.
+      sub_bytes_key_ovs <-
+        verify_mutate_rkeys_slice
+          "aes::soft::fixslice::sub_bytes" {{ Aes::sub_bytes }};
+
+      // Overrides for fixslice::sub_bytes_nots, as used in
+      // aes{128,256}_key_schedule, and in aes192_key_schedule at the end.
+      sub_bytes_nots_key_ovs <-
+        verify_mutate_rkeys_slice
+          "aes::soft::fixslice::sub_bytes_nots" {{ Aes::sub_bytes_nots }};
+
+      // Overrides for fixslice::inv_shift_rows_1, as used in
+      // aes{128,192,256}_key_schedule.
+      inv_shift_rows_1_key_ovs <-
+        verify_mutate_rkeys_slice
+          "aes::soft::fixslice::inv_shift_rows_1" {{ Aes::inv_shift_rows_1 }};
+
+      // Overrides for fixslice::inv_shift_rows_2, as used in
+      // aes{128,192,256}_key_schedule.
+      inv_shift_rows_2_key_ovs <-
+        verify_mutate_rkeys_slice
+          "aes::soft::fixslice::inv_shift_rows_2" {{ Aes::inv_shift_rows_2 }};
+
+      // Overrides for fixslice::inv_shift_rows_3, as used in
+      // aes{128,192,256}_key_schedule.
+      inv_shift_rows_3_key_ovs <-
+        verify_mutate_rkeys_slice
+          "aes::soft::fixslice::inv_shift_rows_3" {{ Aes::inv_shift_rows_3 }};
+
+      // Spec for fixslice::aes{128,192,256}_key_schedule.
+      let key_schedule_spec = do {
+        key <- mir_fresh_cryptol_var "key" {| Aes::KeyBytes |};
+        key_ref <- mir_ref_of (mir_term key);
+        mir_execute_func [key_ref];
+        mir_return (mir_term {{ KeySchedule::key_schedule key }});
+      };
+
+      print "Verifying key schedule might take a while";
+      // On a M4 Mac, this takes ~1 min for AES-128, ~5 min for AES-192, and ~9 min
+      // for AES-256.
+
+      // We don't actually need all of these overrides for each size (128 and 256
+      // don't need sub_bytes_cipher_ov and sub_bytes_nots_tmp_ov, while 192 doesn't
+      // need sub_bytes_key_ovs), but it's simpler to just pass all of them.
+      verify
+        (str_concats ["aes::soft::fixslice::aes", key_size_str, "_key_schedule"])
+        (concats [
+          bitslice_key_ovs,
+          sub_bytes_key_ovs,
+          inv_shift_rows_1_key_ovs,
+          inv_shift_rows_2_key_ovs,
+          inv_shift_rows_3_key_ovs,
+          sub_bytes_nots_key_ovs,
+          [sub_bytes_cipher_ov, sub_bytes_nots_tmp_ov]
+        ])
+        false key_schedule_spec key_schedule_proof;
+    };
+
+    // Spec for fixslice::add_round_key for the given round.
+    let add_round_key_spec (round : Int) = do {
+      state_init <- mir_fresh_cryptol_var "state_init" {| Bitslice::FSState |};
+      state_ref <- mir_ref_of_mut (mir_term state_init);
+      rkeys <- mir_fresh_cryptol_var "rkeys" {| Aes::FSRoundKeys |};
+      rkeys_ref <- mir_ref_of (mir_term rkeys);
+      mir_execute_func [state_ref, slice_round round rkeys_ref];
+      mir_points_to state_ref (mir_term {{
+        Aes::add_round_key state_init (ProofUtils::sliceRound`{round} rkeys)
+      }});
+    };
+
+    // Overrides for fixslice::add_round_key for all rounds.
+    add_round_key_ovs <-
+      for rounds (\i -> do {
+        verify "aes::soft::fixslice::add_round_key" [] false
+          (add_round_key_spec i) rme;
+      });
+
+    // Given a series of Rust functions which take a State by mutable reference,
+    // verify that each one mutates the State according to the Cryptol function
+    // that it is paired with, and return overrides for all of the functions. The
+    // Rust function names do not need to be prefixed with aes::soft::fixslice::.
+    let verify_mix_columns
+        (rust_and_cry_funs : [(String, Term /* FSState -> FSState */)])
+        : TopLevel [MIRSpec]
+    = do {
+      for rust_and_cry_funs (\(rust_fun, cry_fun) -> do {
+        verify (str_concat "aes::soft::fixslice::" rust_fun) [] false
+          (mutate_state_ref_spec cry_fun) rme;
+      });
+    };
+
+    // Rewrite rules to move @ inside AddRoundKey.
+    thms_at_addRoundKey' <-
+      for (eval_list {{ [0..3 : [2]] }}) (\i -> do {
+        // We have to evaluate i here to a SAWScript Int then demote it back to a
+        // Term in the Cryptol expression, so that its SAWCore representation is a
+        // constant and the rewrite rule will fire.
+        let i' = eval_int i;
+        prove' z3 {{
+          \(rkey : Bitslice::FSState) (blocks : BatchBlockBytes) ->
+            Aes::addRoundKey' rkey blocks @ `i'
+            == join
+                (transpose
+                  (Aes::Spec::AddRoundKey
+                    (transpose (split (Bitslice::inv_bitslice rkey @ `i')))
+                    (transpose (split (blocks @ `i')))))
+        }};
+      });
+
+    // Given a state transformation function f, prove a rewrite rule to move @
+    // inside stateTransformation f. This gets rid of the stateTransformation
+    // because the function now only needs to operate on a single block instead of
+    // a batch.
+    let prove_at_stateTransformation
+        (f : Term /* Aes::Spec::State -> Aes::Spec::State */)
+        : TopLevel [Theorem]
+    = do {
+      for (eval_list {{ [0..3 : [2]] }}) (\i -> do {
+        // We have to evaluate i here to a SAWScript Int then demote it back to a
+        // Term in the Cryptol expression, so that its SAWCore representation is a
+        // constant and the rewrite rule will fire.
+        let i' = eval_int i;
+        prove' z3 {{
+          \(blocks : BatchBlockBytes) ->
+            Aes::stateTransformation f blocks @ `i'
+            == join (transpose (f (transpose (split (blocks @ `i')))))
+        }};
+      });
+    };
+
+    // Rewrite rule to cancel out split of join.
+    thm_split_join <- prove' z3 {{
+      \(state : Aes::Spec::State) -> split (join state) == state
+    }};
+
+    // Rewrite rule to cancel out transpose of transpose.
+    thm_transpose_transpose <- prove' z3 {{
+      \(state : Aes::Spec::State) -> transpose (transpose state) == state
+    }};
+
+    // Spec for fixslice::aes{128,192,256}_{encrypt,decrypt}, where aes_crypt is
+    // either Aes::aes_encrypt or Aes::aes_decrypt. We follow cryptol-specs's
+    // convention of calling this operation cipher instead of encrypt/decrypt, to
+    // avoid confusion with the toplevel encrypt/decrypt which includes key
+    // expansion.
+    let cipher_spec
+        (aes_crypt : Term /* FSRoundKeys -> BatchBlockBytes -> BatchBlockBytes */)
+    = do {
+      rkeys <- mir_fresh_cryptol_var "rkeys" {| Aes::FSRoundKeys |};
+      rkeys_ref <- mir_ref_of (mir_term rkeys);
+      block0 <- mir_fresh_cryptol_var "block0" {| Bitslice::BlockBytes |};
+      block1 <- mir_fresh_cryptol_var "block1" {| Bitslice::BlockBytes |};
+      block2 <- mir_fresh_cryptol_var "block2" {| Bitslice::BlockBytes |};
+      block3 <- mir_fresh_cryptol_var "block3" {| Bitslice::BlockBytes |};
+      blocks_ref <- mir_ref_of
+        (mir_struct_value BatchBlocks [
+          mir_array_value (mir_adt Block) [
+            mir_struct_value Block [mir_term block0],
+            mir_struct_value Block [mir_term block1],
+            mir_struct_value Block [mir_term block2],
+            mir_struct_value Block [mir_term block3]
+          ]
+        ]);
+      mir_execute_func [rkeys_ref, blocks_ref];
+      let output =
+        eval_list {{ aes_crypt rkeys [block0, block1, block2, block3] }};
+      mir_return
+        (mir_struct_value BatchBlocks [
+          mir_array_value (mir_adt Block)
+            (map (\block -> mir_struct_value Block [mir_term block]) output)
+        ]);
+    };
+
+    let verify_encipher = do {
+      // Overrides for fixslice::mix_columns_{0,1,2,3}.
+      mix_columns_ovs <- verify_mix_columns [
+        ("mix_columns_0", {{ Aes::mix_columns_0 }}),
+        ("mix_columns_1", {{ Aes::mix_columns_1 }}),
+        ("mix_columns_2", {{ Aes::mix_columns_2 }}),
+        ("mix_columns_3", {{ Aes::mix_columns_3 }})
+      ];
+
+      // The MixColumns{,1,2,3} Cryptol functions.
+      let MixColumnsN = [
+        {{ Aes::Spec::MixColumns }},
+        {{ Aes::MixColumns1 }},
+        {{ Aes::MixColumns2 }},
+        {{ Aes::MixColumns3 }}
+      ];
+
+      // Rewrite rules to move @ inside
+      // stateTransformation (SubBytesNots . SubBytes).
+      thms_at_stateTransformation_SubBytesNots_SubBytes <-
+        prove_at_stateTransformation {{
+          \state -> Aes::SubBytesNots (Aes::Spec::SubBytes state)
+        }};
+
+      // Rewrite rules to move @ inside stateTransformation ShiftRows2.
+      thms_at_stateTransformation_ShiftRows2 <-
+        prove_at_stateTransformation {{
+          \state -> Aes::Spec::ShiftRows (Aes::Spec::ShiftRows state)
+        }};
+
+      // Rewrite rules to move @ inside stateTransformation MixColumns{,1,2,3}.
+      thms_at_stateTransformation_MixColumnsN <- do {
+        nested <- for MixColumnsN prove_at_stateTransformation;
+        return (concats nested);
+      };
+
+      // Rewrite rules to interchange MixColumns{,1,2,3} and SubBytesNots.
+      thms_MixColumnsN_SubBytesNots <-
+        for MixColumnsN (\mixColumns -> do {
+          prove' z3 {{
+            \(state : Aes::Spec::State) ->
+              mixColumns (Aes::SubBytesNots state)
+              == Aes::SubBytesNots (mixColumns state)
+          }};
+        });
+
+      // Rewrite rule to move SubBytesNots from the second argument to the first
+      // argument of AddRoundKey.
+      thm_AddRoundKey_SubBytesNots <- prove' z3 {{
+        \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+          Aes::Spec::AddRoundKey w (Aes::SubBytesNots state)
+          == Aes::Spec::AddRoundKey (Aes::SubBytesNots w) state
+      }};
+
+      // Rewrite rule to pull InvShiftRows in front of AddRoundKey, adding a
+      // ShiftRows to the round key.
+      thm_AddRoundKey_InvShiftRows <- prove' z3 {{
+        \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+          Aes::Spec::AddRoundKey w (Aes::Spec::InvShiftRows state)
+          == Aes::Spec::InvShiftRows
+              (Aes::Spec::AddRoundKey (Aes::Spec::ShiftRows w) state)
+      }};
+
+      // Rewrite rule to pull ShiftRows2 in front of AddRoundKey, adding a
+      // ShiftRows2 to the round key.
+      thm_AddRoundKey_ShiftRows2 <- prove' z3 {{
+        \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+          Aes::Spec::AddRoundKey w
+            (Aes::Spec::ShiftRows (Aes::Spec::ShiftRows state))
+          == Aes::Spec::ShiftRows
+              (Aes::Spec::ShiftRows
+                (Aes::Spec::AddRoundKey
+                  (Aes::Spec::ShiftRows (Aes::Spec::ShiftRows w))
+                  state))
+      }};
+
+      // Rewrite rule to pull ShiftRows in front of AddRoundKey, adding a
+      // InvShiftRows to the round key.
+      thm_AddRoundKey_ShiftRows <- prove' z3 {{
+        \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+          Aes::Spec::AddRoundKey w (Aes::Spec::ShiftRows state)
+          == Aes::Spec::ShiftRows
+              (Aes::Spec::AddRoundKey (Aes::Spec::InvShiftRows w) state)
+      }};
+
+      // Rewrite rule to interchange SubBytes and InvShiftRows.
+      thm_SubBytes_InvShiftRows <- prove' z3 {{
+        \(state : Aes::Spec::State) ->
+          Aes::Spec::SubBytes (Aes::Spec::InvShiftRows state)
+          == Aes::Spec::InvShiftRows (Aes::Spec::SubBytes state)
+      }};
+
+      // Rewrite rule to interchange SubBytes and ShiftRows.
+      thm_SubBytes_ShiftRows <- prove' z3 {{
+        \(state : Aes::Spec::State) ->
+          Aes::Spec::SubBytes (Aes::Spec::ShiftRows state)
+          == Aes::Spec::ShiftRows (Aes::Spec::SubBytes state)
+      }};
+
+      // Rewrite rule to cancel out ShiftRows of InvShiftRows.
+      thm_ShiftRows_InvShiftRows <- prove' z3 {{
+        \(state : Aes::Spec::State) ->
+          Aes::Spec::ShiftRows (Aes::Spec::InvShiftRows state) == state
+      }};
+
+      // Rewrite rule to cancel out InvShiftRows of ShiftRows.
+      thm_InvShiftRows_ShiftRows <- prove' z3 {{
+        Aes::Spec::shiftRowsInverts
+      }};
+
+      verify
+        (str_concats ["aes::soft::fixslice::aes", key_size_str, "_encrypt"])
+        (concats [
+          add_round_key_ovs,
+          mix_columns_ovs,
+          [
+            bitslice_cipher_ov,
+            inv_bitslice_ov,
+            sub_bytes_cipher_ov,
+            shift_rows_2_ov
+          ]
+        ])
+        false
+        (cipher_spec {{ Aes::aes_encrypt }})
+        do {
+          unfolding [
+            "add_round_key",
+            "sub_bytes",
+            "mix_columns_0",
+            "mix_columns_1",
+            "mix_columns_2",
+            "mix_columns_3",
+            "shift_rows_2",
+            "bitsliced"
+          ];
+
+          // For this spec, SAW generates goals of the form `rust_output @ i ==
+          // cryptol_spec @ i` for i = 0 to 3. We cancel out the adjacent
+          // inv_bitslice and bitslice coming from adjacent uses of bitsliced,
+          // then push the @ through all the steps in the rust_output, until we
+          // have @ directly applied to the round keys and the batch blocks input,
+          // and all the AES operations are operating on a single block. Then we
+          // cancel out the adjacent split/join and transpose/transpose so that
+          // everything is operating on the cryptol-specs State. We also move
+          // SubBytesNots in front of MixColumnsN so that it is next to
+          // AddRoundKey.
+          simplify
+            (addsimps
+              (concats [
+                thms_at_addRoundKey',
+                thms_at_stateTransformation_SubBytesNots_SubBytes,
+                thms_at_stateTransformation_ShiftRows2,
+                thms_at_stateTransformation_MixColumnsN,
+                thms_MixColumnsN_SubBytesNots,
+                [
+                  thm_inv_bitslice_bitslice,
+                  thm_split_join,
+                  thm_transpose_transpose
+                ]
+              ])
+              empty_ss);
+
+          // Expand the ShiftRows and InvShiftRows from MixColumnsN.
+          unfolding ["MixColumns1", "MixColumns2", "MixColumns3"];
+
+          // For each call to AddRoundKey, we want its first argument to
+          // correspond exactly to the inverse adjustments performed by
+          // Aes::invBitsliceAdjustKeySchedule on the matching round key. We can
+          // do this by moving all the SubBytesNots from the blocks to the round
+          // keys, then adjusting ShiftRows/InvShiftRows accordingly so that the
+          // round keys get shifted as well. Note that the order of
+          // simplifications matters here.
+          simplify (addsimp thm_AddRoundKey_SubBytesNots empty_ss);
+          simplify (addsimp thm_AddRoundKey_ShiftRows2 empty_ss);
+          simplify
+            (addsimps
+              [thm_AddRoundKey_ShiftRows, thm_AddRoundKey_InvShiftRows]
+              empty_ss);
+
+          // Push the SubBytes under ShiftRows and InvShiftRows and cancel out
+          // pairs of ShiftRows and InvShiftRows.
+          simplify
+            (addsimps [
+              thm_SubBytes_ShiftRows,
+              thm_SubBytes_InvShiftRows,
+              thm_ShiftRows_InvShiftRows,
+              thm_InvShiftRows_ShiftRows
+            ] empty_ss);
+
+          // The sequence of AES operations now exactly matches the spec from
+          // cryptol-specs. The solver should be able to verify this quickly with
+          // the operations kept uninterpreted.
+          unint_z3 [
+            "AddRoundKey",
+            "SubBytes",
+            "ShiftRows",
+            "MixColumns"
+          ];
+        };
+    };
+
+    let verify_decipher = do {
+      // Override for fixslice::inv_sub_bytes.
+      inv_sub_bytes_ov <-
+        verify "aes::soft::fixslice::inv_sub_bytes" [] false
+          (mutate_state_slice_spec {{ Aes::inv_sub_bytes }}) rme;
+
+      // Override for fixslice::inv_shift_rows_2. Note that the Cryptol
+      // specification is not Aes::inv_shift_rows_2, which is defined as
+      // Aes::shift_rows_2, which in turn is a bitsliced state transformation of
+      // applying ShiftRows twice. Instead, we use a custom definition of applying
+      // InvShiftRows twice. These are equivalent, but the decipher proof needs it
+      // to be InvShiftRows instead of ShiftRows, so instead of doing a rewrite
+      // later, we just do the override with a different spec now. (We can't just
+      // change the definition of Aes::inv_shift_rows_2 on the Cryptol side, because
+      // the key schedule proofs also rely on it, and they take twice as long to
+      // verify if we change Aes::inv_shift_rows_2 to this definition.)
+      inv_shift_rows_2_ov <-
+        verify "aes::soft::fixslice::inv_shift_rows_2" [] false
+          (mutate_state_slice_spec {{
+            Bitslice::bitsliced
+              (Aes::stateTransformation
+                (\state ->
+                  Aes::Spec::InvShiftRows (Aes::Spec::InvShiftRows state)))
+          }})
+          rme;
+
+      // Overrides for fixslice::inv_mix_columns_{0,1,2,3}.
+      inv_mix_columns_ovs <- verify_mix_columns [
+        ("inv_mix_columns_0", {{ Aes::inv_mix_columns_0 }}),
+        ("inv_mix_columns_1", {{ Aes::inv_mix_columns_1 }}),
+        ("inv_mix_columns_2", {{ Aes::inv_mix_columns_2 }}),
+        ("inv_mix_columns_3", {{ Aes::inv_mix_columns_3 }})
+      ];
+
+      // The InvMixColumns{,1,2,3} Cryptol functions.
+      let InvMixColumnsN = [
+        {{ Aes::Spec::InvMixColumns }},
+        {{ Aes::InvMixColumns1 }},
+        {{ Aes::InvMixColumns2 }},
+        {{ Aes::InvMixColumns3 }}
+      ];
+
+      // Rewrite rules to move @ inside
+      // stateTransformation (InvSubBytes . SubBytesNots).
+      thms_at_stateTransformation_InvSubBytes_SubBytesNots <-
+        prove_at_stateTransformation {{
+          \state -> Aes::Spec::InvSubBytes (Aes::SubBytesNots state)
+        }};
+
+      // Rewrite rules to move @ inside stateTransformation InvShiftRows2.
+      thms_at_stateTransformation_InvShiftRows2 <-
+        prove_at_stateTransformation {{
+          \state -> Aes::Spec::InvShiftRows (Aes::Spec::InvShiftRows state)
+        }};
+
+      // Rewrite rules to move @ inside stateTransformation InvMixColumns{,1,2,3}.
+      thms_at_stateTransformation_InvMixColumnsN <- do {
+        nested <- for InvMixColumnsN prove_at_stateTransformation;
+        return (concats nested);
+      };
+
+      // Rewrite rules to interchange SubBytesNots and InvMixColumns{0,1,2,3}.
+      thms_SubBytesNots_InvMixColumnsN <-
+        for InvMixColumnsN (\invMixColumns -> do {
+          prove' z3 {{
+            \(state : Aes::Spec::State) ->
+              Aes::SubBytesNots (invMixColumns state)
+              == invMixColumns (Aes::SubBytesNots state)
+          }};
+        });
+
+      // Rewrite rule to push SubBytesNots into the first argument of AddRoundKey.
+      thm_SubBytesNots_AddRoundKey <- prove' z3 {{
+        \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+          Aes::SubBytesNots (Aes::Spec::AddRoundKey w state)
+          == Aes::Spec::AddRoundKey (Aes::SubBytesNots w) state
+      }};
+
+      // Rewrite rule to cancel out the ShiftRows and InvShiftRows around
+      // AddRoundKey of InvSubBytes, by adding a ShiftRows to the round key.
+      thm_ShiftRows_AddRoundKey_InvSubBytes_InvShiftRows <- prove' z3 {{
+        \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+          Aes::Spec::ShiftRows
+            (Aes::Spec::AddRoundKey w
+              (Aes::Spec::InvSubBytes (Aes::Spec::InvShiftRows state)))
+          == Aes::Spec::AddRoundKey
+              (Aes::Spec::ShiftRows w)
+              (Aes::Spec::InvSubBytes state)
+      }};
+
+      // Rewrite rule to change InvShiftRows2 of AddRoundKey of InvSubBytes of
+      // ShiftRows into AddRoundKey of InvSubBytes of InvShiftRows, by adding a
+      // ShiftRows2 to the round key.
+      thm_InvShiftRows2_AddRoundKey_InvSubBytes_ShiftRows <- prove' z3 {{
+        \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+          Aes::Spec::InvShiftRows
+            (Aes::Spec::InvShiftRows
+              (Aes::Spec::AddRoundKey w
+                (Aes::Spec::InvSubBytes (Aes::Spec::ShiftRows state))))
+          == Aes::Spec::AddRoundKey
+              (Aes::Spec::ShiftRows (Aes::Spec::ShiftRows w))
+              (Aes::Spec::InvSubBytes (Aes::Spec::InvShiftRows state))
+      }};
+
+      // Rewrite rule to change InvShiftRows of AddRoundKey of InvSubBytes into
+      // AddRoundKey of InvSubBytes of InvShiftRows, by adding a InvShiftRows to the
+      // round key.
+      thm_InvShiftRows_AddRoundKey_InvSubBytes <- prove' z3 {{
+        \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+          Aes::Spec::InvShiftRows
+            (Aes::Spec::AddRoundKey w (Aes::Spec::InvSubBytes state))
+          == Aes::Spec::AddRoundKey
+              (Aes::Spec::InvShiftRows w)
+              (Aes::Spec::InvSubBytes (Aes::Spec::InvShiftRows state))
+      }};
+
+      // Rewrite rule to interchange InvShiftRows and InvSubBytes.
+      thm_InvShiftRows_InvSubBytes <- prove' z3 {{
+        \(state : Aes::Spec::State) ->
+          Aes::Spec::InvShiftRows (Aes::Spec::InvSubBytes state)
+          == Aes::Spec::InvSubBytes (Aes::Spec::InvShiftRows state)
+      }};
+
+      verify
+        (str_concats ["aes::soft::fixslice::aes", key_size_str, "_decrypt"])
+        (concats [
+          add_round_key_ovs,
+          inv_mix_columns_ovs,
+          [
+            bitslice_cipher_ov,
+            inv_bitslice_ov,
+            inv_sub_bytes_ov,
+            inv_shift_rows_2_ov
+          ]
+        ])
+        false
+        (cipher_spec {{ Aes::aes_decrypt }})
+        do {
+          unfolding [
+            "add_round_key",
+            "inv_sub_bytes",
+            "inv_mix_columns_0",
+            "inv_mix_columns_1",
+            "inv_mix_columns_2",
+            "inv_mix_columns_3",
+            "inv_shift_rows_2",
+            "bitsliced"
+          ];
+
+          // For this spec, SAW generates goals of the form `rust_output @ i ==
+          // cryptol_spec @ i` for i = 0 to 3. We cancel out the adjacent
+          // inv_bitslice and bitslice coming from adjacent uses of bitsliced,
+          // then push the @ through all the steps in the rust_output, until we
+          // have @ directly applied to the round keys and the batch blocks input,
+          // and all the AES operations are operating on a single block. Then we
+          // cancel out the adjacent split/join and transpose/transpose so that
+          // everything is operating on the cryptol-specs State. We also move
+          // SubBytesNots after MixColumnsN so that it is next to AddRoundKey, and
+          // move InvShiftRows after InvSubBytes so that it matches the AES spec.
+          simplify
+            (addsimps
+              (concats [
+                thms_at_addRoundKey',
+                thms_at_stateTransformation_InvSubBytes_SubBytesNots,
+                thms_at_stateTransformation_InvShiftRows2,
+                thms_at_stateTransformation_InvMixColumnsN,
+                thms_SubBytesNots_InvMixColumnsN,
+                [
+                  thm_inv_bitslice_bitslice,
+                  thm_split_join,
+                  thm_transpose_transpose,
+                  thm_InvShiftRows_InvSubBytes
+                ]
+              ])
+              empty_ss);
+
+          // Expand the ShiftRows and InvShiftRows from InvMixColumnsN.
+          unfolding ["InvMixColumns1", "InvMixColumns2", "InvMixColumns3"];
+
+          // For each call to AddRoundKey, we want its first argument to
+          // correspond exactly to the inverse adjustments performed by
+          // Aes::invBitsliceAdjustKeySchedule on the matching round key. We can
+          // do this by moving all the SubBytesNots from the blocks to the round
+          // keys, then adjusting ShiftRows/InvShiftRows accordingly so that the
+          // round keys get shifted as well. Note that the order of
+          // simplifications matters here.
+          simplify (addsimp thm_SubBytesNots_AddRoundKey empty_ss);
+          simplify
+            (addsimp
+              thm_InvShiftRows2_AddRoundKey_InvSubBytes_ShiftRows
+              empty_ss);
+          simplify
+            (addsimps [
+              thm_ShiftRows_AddRoundKey_InvSubBytes_InvShiftRows,
+              thm_InvShiftRows_AddRoundKey_InvSubBytes
+            ] empty_ss);
+
+          // The sequence of AES operations now exactly matches the spec from
+          // cryptol-specs. The solver should be able to verify this quickly with
+          // the operations kept uninterpreted.
+          unint_z3 [
+            "AddRoundKey",
+            "InvSubBytes",
+            "InvShiftRows",
+            "InvMixColumns"
+          ];
+        };
+    };
+
+    return {
+      Aes = Aes,
+      KeySchedule = KeySchedule,
+      key_size_str = key_size_str,
+      verify_key_schedule = verify_key_schedule,
+      verify_encipher = verify_encipher,
+      verify_decipher = verify_decipher
+    };
+  };
+
+  // Spec for fixslice::bitslice, as used in aes128_key_schedule.
+  let bitslice_key_128_spec = do {
+    rkeys_init <- mir_fresh_cryptol_var "rkeys_init" {| Aes128::FSRoundKeys |};
+    rkeys_ref <- mir_ref_of_mut (mir_term rkeys_init);
+    key <- mir_fresh_cryptol_var "key" {| Aes128::KeyBytes |};
+    key_ref <- mir_ref_of (mir_term key);
+    mir_execute_func [
+      mir_slice_range_value rkeys_ref 0 8,
+      mir_slice_value key_ref,
+      mir_slice_value key_ref,
+      mir_slice_value key_ref,
+      mir_slice_value key_ref
+    ];
+    mir_points_to rkeys_ref (mir_term {{
+      Bitslice::bitslice [key, key, key, key] # drop`{8} rkeys_init
+    }});
+  };
+
+  bitslice_key_128_ov <-
+    verify "aes::soft::fixslice::bitslice" [] false
+      bitslice_key_128_spec rme;
+
+  aes128 <- mk_aes_size
+    Aes128
+    AesKeySchedule128
+    [bitslice_key_128_ov]
+    // Keep SBox uninterpreted when verifying aes128_key_schedule. If SBox is
+    // expanded, it runs for a very long time (longer than verifying
+    // aes192_key_schedule with SBox expanded, for some reason).
+    (unint_z3 ["SBox"]);
+
+  // Spec for fixslice::bitslice, as used in the first call in
+  // aes192_key_schedule.
+  let bitslice_key_192_front_spec = do {
+    rkeys_init <- mir_fresh_cryptol_var "rkeys_init" {| Aes192::FSRoundKeys |};
+    rkeys_ref <- mir_ref_of_mut (mir_term rkeys_init);
+    key <- mir_fresh_cryptol_var "key" {| Aes192::KeyBytes |};
+    key_ref <- mir_ref_of (mir_term key);
+    mir_execute_func [
+      mir_slice_range_value rkeys_ref 0 8,
+      mir_slice_range_value key_ref 0 16,
+      mir_slice_range_value key_ref 0 16,
+      mir_slice_range_value key_ref 0 16,
+      mir_slice_range_value key_ref 0 16
+    ];
+    mir_points_to rkeys_ref (mir_term {{
+      Bitslice::bitslice [take key, take key, take key, take key]
+      # drop`{8} rkeys_init
+    }});
+  };
+
+  bitslice_key_192_front_ov <-
+    verify "aes::soft::fixslice::bitslice" [] false
+      bitslice_key_192_front_spec rme;
+
+  // Spec for fixslice::bitslice, as used in the second call in
+  // aes192_key_schedule.
+  let bitslice_key_192_back_spec = do {
+    tmp_init <- mir_fresh_cryptol_var "tmp_init" {| Bitslice::FSState |};
+    tmp_ref <- mir_ref_of_mut (mir_term tmp_init);
+    key <- mir_fresh_cryptol_var "key" {| Aes192::KeyBytes |};
+    key_ref <- mir_ref_of (mir_term key);
+    mir_execute_func [
+      mir_slice_value tmp_ref,
+      mir_slice_range_value key_ref 8 24,
+      mir_slice_range_value key_ref 8 24,
+      mir_slice_range_value key_ref 8 24,
+      mir_slice_range_value key_ref 8 24
+    ];
+    mir_points_to tmp_ref (mir_term {{
+      Bitslice::bitslice [drop key, drop key, drop key, drop key]
+    }});
+  };
+
+  bitslice_key_192_back_ov <-
+    verify "aes::soft::fixslice::bitslice" [] false
+      bitslice_key_192_back_spec rme;
+
+  aes192 <- mk_aes_size
+    Aes192
+    AesKeySchedule192
+    [bitslice_key_192_front_ov, bitslice_key_192_back_ov]
+    // For some reason keeping SBox uninterpreted doesn't work for the
+    // aes192_key_schedule proof, so we use regular z3.
+    z3;
+
+  // Spec for fixslice::bitslice, as used in the first call in
+  // aes256_key_schedule.
+  let bitslice_key_256_front_spec = do {
+    rkeys_init <- mir_fresh_cryptol_var "rkeys_init" {| Aes256::FSRoundKeys |};
+    rkeys_ref <- mir_ref_of_mut (mir_term rkeys_init);
+    key <- mir_fresh_cryptol_var "key" {| Aes256::KeyBytes |};
+    key_ref <- mir_ref_of (mir_term key);
+    mir_execute_func [
+      mir_slice_range_value rkeys_ref 0 8,
+      mir_slice_range_value key_ref 0 16,
+      mir_slice_range_value key_ref 0 16,
+      mir_slice_range_value key_ref 0 16,
+      mir_slice_range_value key_ref 0 16
+    ];
+    mir_points_to rkeys_ref (mir_term {{
+      Bitslice::bitslice [take key, take key, take key, take key]
+      # drop`{8} rkeys_init
+    }});
+  };
+
+  bitslice_key_256_front_ov <-
+    verify "aes::soft::fixslice::bitslice" [] false
+      bitslice_key_256_front_spec rme;
+
+  // Spec for fixslice::bitslice, as used in the second call in
+  // aes256_key_schedule.
+  let bitslice_key_256_back_spec = do {
+    rkeys_init <- mir_fresh_cryptol_var "rkeys_init" {| Aes256::FSRoundKeys |};
+    rkeys_ref <- mir_ref_of_mut (mir_term rkeys_init);
+    key <- mir_fresh_cryptol_var "key" {| Aes256::KeyBytes |};
+    key_ref <- mir_ref_of (mir_term key);
+    mir_execute_func [
+      mir_slice_range_value rkeys_ref 8 16,
+      mir_slice_range_value key_ref 16 32,
+      mir_slice_range_value key_ref 16 32,
+      mir_slice_range_value key_ref 16 32,
+      mir_slice_range_value key_ref 16 32
+    ];
+    mir_points_to rkeys_ref (mir_term {{
+        take`{8} rkeys_init
+        # Bitslice::bitslice [drop key, drop key, drop key, drop key]
+        # drop`{16} rkeys_init
+    }});
+  };
+
+  bitslice_key_256_back_ov <-
+    verify "aes::soft::fixslice::bitslice" [] false
+      bitslice_key_256_back_spec rme;
+
+  aes256 <- mk_aes_size
+    Aes256
+    AesKeySchedule256
+    [bitslice_key_256_front_ov, bitslice_key_256_back_ov]
+    // For some reason keeping SBox uninterpreted doesn't work for the
+    // aes256_key_schedule proof, so we use regular z3.
+    z3;
+
+  return { aes128 = aes128, aes192 = aes192, aes256 = aes256 };
+};
+
+//   let verify_size (aes : AesSize) : TopLevel AesOverrides = do {
+//     let Aes = aes.Aes;
+//     let KeySchedule = aes.KeySchedule;
+
+//     // Key size as a string.
+//     let key_size_str = show {| Aes::Spec::KeySize |};
+
+//     print (str_concat "Verifying AES-" key_size_str);
+
+//     // Integers from 0 through the number of rounds, inclusive, which can be used
+//     // as indices into the bitsliced round keys array with slice_round and
+//     // sliceRound/modifyRound. Note that the length of this list is one more than
+//     // the number of rounds.
+//     let rounds = map eval_int (eval_list {{ [0..Aes::Spec::Nr : [64]] }});
+
+//     // Override for fixslice::sub_bytes, as used in
+//     // aes{128,192,256}_{encrypt_decrypt} and aes192_key_schedule.
+//     sub_bytes_cipher_ov <-
+//       mir_verify m "aes::soft::fixslice::sub_bytes" [] false
+//         (mutate_state_slice_spec {{ Aes::sub_bytes }}) rme;
+
+//     // Override for fixslice::sub_bytes_nots, as used in aes192_key_schedule
+//     // inside the main loop, when it is called on a slice of tmp: [u64; 8].
+//     sub_bytes_nots_tmp_ov <-
+//       mir_verify m "aes::soft::fixslice::sub_bytes_nots" [] false
+//         (mutate_state_slice_spec {{ Aes::sub_bytes_nots }}) rme;
+
+//     // Override for fixslice::shift_rows_2, as used in aes{128,256}_encrypt.
+//     shift_rows_2_ov <-
+//       mir_verify m "aes::soft::fixslice::shift_rows_2" [] false
+//         (mutate_state_slice_spec {{ Aes::shift_rows_2 }}) rme;
+
+//     // Spec for functions which take a mutable slice of a round key from the
+//     // bitsliced round keys array and mutate it according to the given Cryptol
+//     // function.
+//     let mutate_rkeys_slice_spec
+//         (round : Int)
+//         (cry_fun : Term /* FSState -> FSState */)
+//     = do {
+//       rkeys_init <- mir_fresh_cryptol_var "rkeys_init" {| Aes::FSRoundKeys |};
+//       rkeys_ref <- mir_ref_of_mut (mir_term rkeys_init);
+//       mir_execute_func [slice_round round rkeys_ref];
+//       mir_points_to rkeys_ref (mir_term {{
+//         ProofUtils::modifyRound`{round} cry_fun rkeys_init
+//       }});
+//     };
+
+//     // Verify a function which takes a mutable slice of a round key from the
+//     // bitsliced round keys array and mutates it according to the given Cryptol
+//     // function, and obtain overrides for it for all round keys in the bitsliced
+//     // round key array.
+//     let verify_mutate_rkeys_slice
+//         (rust_fun : String)
+//         (cry_fun : Term /* FSState -> FSState */)
+//         : TopLevel [MIRSpec]
+//     = do {
+//       for rounds (\i -> do {
+//         mir_verify m rust_fun [] false (mutate_rkeys_slice_spec i cry_fun) rme;
+//       });
+//     };
+
+//     // Overrides for fixslice::sub_bytes, as used in aes{128,256}_key_schedule.
+//     sub_bytes_key_ovs <-
+//       verify_mutate_rkeys_slice
+//         "aes::soft::fixslice::sub_bytes" {{ Aes::sub_bytes }};
+
+//     // Overrides for fixslice::sub_bytes_nots, as used in
+//     // aes{128,256}_key_schedule, and in aes192_key_schedule at the end.
+//     sub_bytes_nots_key_ovs <-
+//       verify_mutate_rkeys_slice
+//         "aes::soft::fixslice::sub_bytes_nots" {{ Aes::sub_bytes_nots }};
+
+//     // Overrides for fixslice::inv_shift_rows_1, as used in
+//     // aes{128,192,256}_key_schedule.
+//     inv_shift_rows_1_key_ovs <-
+//       verify_mutate_rkeys_slice
+//         "aes::soft::fixslice::inv_shift_rows_1" {{ Aes::inv_shift_rows_1 }};
+
+//     // Overrides for fixslice::inv_shift_rows_2, as used in
+//     // aes{128,192,256}_key_schedule.
+//     inv_shift_rows_2_key_ovs <-
+//       verify_mutate_rkeys_slice
+//         "aes::soft::fixslice::inv_shift_rows_2" {{ Aes::inv_shift_rows_2 }};
+
+//     // Overrides for fixslice::inv_shift_rows_3, as used in
+//     // aes{128,192,256}_key_schedule.
+//     inv_shift_rows_3_key_ovs <-
+//       verify_mutate_rkeys_slice
+//         "aes::soft::fixslice::inv_shift_rows_3" {{ Aes::inv_shift_rows_3 }};
+
+//     // Spec for fixslice::aes{128,192,256}_key_schedule.
+//     let key_schedule_spec = do {
+//       key <- mir_fresh_cryptol_var "key" {| Aes::KeyBytes |};
+//       key_ref <- mir_ref_of (mir_term key);
+//       mir_execute_func [key_ref];
+//       mir_return (mir_term {{ KeySchedule::key_schedule key }});
+//     };
+
+//     print "Verifying key schedule might take a while";
+//     // On a M4 Mac, this takes ~1 min for AES-128, ~5 min for AES-192, and ~9 min
+//     // for AES-256.
+
+//     // We don't actually need all of these overrides for each size (128 and 256
+//     // don't need sub_bytes_cipher_ov and sub_bytes_nots_tmp_ov, while 192 doesn't
+//     // need sub_bytes_key_ovs), but it's simpler to just pass all of them.
+//     key_schedule_ov <- mir_verify m
+//       (str_concats ["aes::soft::fixslice::aes", key_size_str, "_key_schedule"])
+//       (concats [
+//         aes.bitslice_key_ovs,
+//         sub_bytes_key_ovs,
+//         inv_shift_rows_1_key_ovs,
+//         inv_shift_rows_2_key_ovs,
+//         inv_shift_rows_3_key_ovs,
+//         sub_bytes_nots_key_ovs,
+//         [sub_bytes_cipher_ov, sub_bytes_nots_tmp_ov]
+//       ])
+//       false key_schedule_spec aes.key_schedule_proof;
+
+//     // Spec for fixslice::add_round_key for the given round.
+//     let add_round_key_spec (round : Int) = do {
+//       state_init <- mir_fresh_cryptol_var "state_init" {| Bitslice::FSState |};
+//       state_ref <- mir_ref_of_mut (mir_term state_init);
+//       rkeys <- mir_fresh_cryptol_var "rkeys" {| Aes::FSRoundKeys |};
+//       rkeys_ref <- mir_ref_of (mir_term rkeys);
+//       mir_execute_func [state_ref, slice_round round rkeys_ref];
+//       mir_points_to state_ref (mir_term {{
+//         Aes::add_round_key state_init (ProofUtils::sliceRound`{round} rkeys)
+//       }});
+//     };
+
+//     // Overrides for fixslice::add_round_key for all rounds.
+//     add_round_key_ovs <-
+//       for rounds (\i -> do {
+//         mir_verify m "aes::soft::fixslice::add_round_key" [] false
+//           (add_round_key_spec i) rme;
+//       });
+
+//     // Given a series of Rust functions which take a State by mutable reference,
+//     // verify that each one mutates the State according to the Cryptol function
+//     // that it is paired with, and return overrides for all of the functions. The
+//     // Rust function names do not need to be prefixed with aes::soft::fixslice::.
+//     let verify_mix_columns
+//         (rust_and_cry_funs : [(String, Term /* FSState -> FSState */)])
+//         : TopLevel [MIRSpec]
+//     = do {
+//       for rust_and_cry_funs (\(rust_fun, cry_fun) -> do {
+//         mir_verify m (str_concat "aes::soft::fixslice::" rust_fun) [] false
+//           (mutate_state_ref_spec cry_fun) rme;
+//       });
+//     };
+
+//     // Overrides for fixslice::mix_columns_{0,1,2,3}.
+//     mix_columns_ovs <- verify_mix_columns [
+//       ("mix_columns_0", {{ Aes::mix_columns_0 }}),
+//       ("mix_columns_1", {{ Aes::mix_columns_1 }}),
+//       ("mix_columns_2", {{ Aes::mix_columns_2 }}),
+//       ("mix_columns_3", {{ Aes::mix_columns_3 }})
+//     ];
+
+//     // The MixColumns{,1,2,3} Cryptol functions.
+//     let MixColumnsN = [
+//       {{ Aes::Spec::MixColumns }},
+//       {{ Aes::MixColumns1 }},
+//       {{ Aes::MixColumns2 }},
+//       {{ Aes::MixColumns3 }}
+//     ];
+
+//     // Rewrite rules to interchange MixColumns{,1,2,3} and SubBytesNots.
+//     thms_MixColumnsN_SubBytesNots <-
+//       for MixColumnsN (\mixColumns -> do {
+//         prove_print z3 {{
+//           \(state : Aes::Spec::State) ->
+//             mixColumns (Aes::SubBytesNots state)
+//             == Aes::SubBytesNots (mixColumns state)
+//         }};
+//       });
+
+//     // Rewrite rules to move @ inside AddRoundKey.
+//     thms_at_addRoundKey' <-
+//       for (eval_list {{ [0..3 : [2]] }}) (\i -> do {
+//         // We have to evaluate i here to a SAWScript Int then demote it back to a
+//         // Term in the Cryptol expression, so that its SAWCore representation is a
+//         // constant and the rewrite rule will fire.
+//         let i' = eval_int i;
+//         prove_print z3 {{
+//           \(rkey : Bitslice::FSState) (blocks : BatchBlockBytes) ->
+//             Aes::addRoundKey' rkey blocks @ `i'
+//             == join
+//                 (transpose
+//                   (Aes::Spec::AddRoundKey
+//                     (transpose (split (Bitslice::inv_bitslice rkey @ `i')))
+//                     (transpose (split (blocks @ `i')))))
+//         }};
+//       });
+
+//     // Given a state transformation function f, prove a rewrite rule to move @
+//     // inside stateTransformation f. This gets rid of the stateTransformation
+//     // because the function now only needs to operate on a single block instead of
+//     // a batch.
+//     let prove_at_stateTransformation
+//         (f : Term /* Aes::Spec::State -> Aes::Spec::State */)
+//         : TopLevel [Theorem]
+//     = do {
+//       for (eval_list {{ [0..3 : [2]] }}) (\i -> do {
+//         // We have to evaluate i here to a SAWScript Int then demote it back to a
+//         // Term in the Cryptol expression, so that its SAWCore representation is a
+//         // constant and the rewrite rule will fire.
+//         let i' = eval_int i;
+//         prove_print z3 {{
+//           \(blocks : BatchBlockBytes) ->
+//             Aes::stateTransformation f blocks @ `i'
+//             == join (transpose (f (transpose (split (blocks @ `i')))))
+//         }};
+//       });
+//     };
+
+//     // Rewrite rules to move @ inside
+//     // stateTransformation (SubBytesNots . SubBytes).
+//     thms_at_stateTransformation_SubBytesNots_SubBytes <-
+//       prove_at_stateTransformation {{
+//         \state -> Aes::SubBytesNots (Aes::Spec::SubBytes state)
+//       }};
+
+//     // Rewrite rules to move @ inside stateTransformation ShiftRows2.
+//     thms_at_stateTransformation_ShiftRows2 <-
+//       prove_at_stateTransformation {{
+//         \state -> Aes::Spec::ShiftRows (Aes::Spec::ShiftRows state)
+//       }};
+
+//     // Rewrite rules to move @ inside stateTransformation MixColumns{,1,2,3}.
+//     thms_at_stateTransformation_MixColumnsN <- do {
+//       nested <- for MixColumnsN prove_at_stateTransformation;
+//       return (concats nested);
+//     };
+
+//     // Rewrite rule to cancel out split of join.
+//     thm_split_join <- prove_print z3 {{
+//       \(state : Aes::Spec::State) -> split (join state) == state
+//     }};
+
+//     // Rewrite rule to cancel out transpose of transpose.
+//     thm_transpose_transpose <- prove_print z3 {{
+//       \(state : Aes::Spec::State) -> transpose (transpose state) == state
+//     }};
+
+//     // Rewrite rule to move SubBytesNots from the second argument to the first
+//     // argument of AddRoundKey.
+//     thm_AddRoundKey_SubBytesNots <- prove_print z3 {{
+//       \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+//         Aes::Spec::AddRoundKey w (Aes::SubBytesNots state)
+//         == Aes::Spec::AddRoundKey (Aes::SubBytesNots w) state
+//     }};
+
+//     // Rewrite rule to pull InvShiftRows in front of AddRoundKey, adding a
+//     // ShiftRows to the round key.
+//     thm_AddRoundKey_InvShiftRows <- prove_print z3 {{
+//       \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+//         Aes::Spec::AddRoundKey w (Aes::Spec::InvShiftRows state)
+//         == Aes::Spec::InvShiftRows
+//             (Aes::Spec::AddRoundKey (Aes::Spec::ShiftRows w) state)
+//     }};
+
+//     // Rewrite rule to pull ShiftRows2 in front of AddRoundKey, adding a
+//     // ShiftRows2 to the round key.
+//     thm_AddRoundKey_ShiftRows2 <- prove_print z3 {{
+//       \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+//         Aes::Spec::AddRoundKey w
+//           (Aes::Spec::ShiftRows (Aes::Spec::ShiftRows state))
+//         == Aes::Spec::ShiftRows
+//             (Aes::Spec::ShiftRows
+//               (Aes::Spec::AddRoundKey
+//                 (Aes::Spec::ShiftRows (Aes::Spec::ShiftRows w))
+//                 state))
+//     }};
+
+//     // Rewrite rule to pull ShiftRows in front of AddRoundKey, adding a
+//     // InvShiftRows to the round key.
+//     thm_AddRoundKey_ShiftRows <- prove_print z3 {{
+//       \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+//         Aes::Spec::AddRoundKey w (Aes::Spec::ShiftRows state)
+//         == Aes::Spec::ShiftRows
+//             (Aes::Spec::AddRoundKey (Aes::Spec::InvShiftRows w) state)
+//     }};
+
+//     // Rewrite rule to interchange SubBytes and InvShiftRows.
+//     thm_SubBytes_InvShiftRows <- prove_print z3 {{
+//       \(state : Aes::Spec::State) ->
+//         Aes::Spec::SubBytes (Aes::Spec::InvShiftRows state)
+//         == Aes::Spec::InvShiftRows (Aes::Spec::SubBytes state)
+//     }};
+
+//     // Rewrite rule to interchange SubBytes and ShiftRows.
+//     thm_SubBytes_ShiftRows <- prove_print z3 {{
+//       \(state : Aes::Spec::State) ->
+//         Aes::Spec::SubBytes (Aes::Spec::ShiftRows state)
+//         == Aes::Spec::ShiftRows (Aes::Spec::SubBytes state)
+//     }};
+
+//     // Rewrite rule to cancel out ShiftRows of InvShiftRows.
+//     thm_ShiftRows_InvShiftRows <- prove_print z3 {{
+//       \(state : Aes::Spec::State) ->
+//         Aes::Spec::ShiftRows (Aes::Spec::InvShiftRows state) == state
+//     }};
+
+//     // Rewrite rule to cancel out InvShiftRows of ShiftRows.
+//     thm_InvShiftRows_ShiftRows <- prove_print z3 {{
+//       Aes::Spec::shiftRowsInverts
+//     }};
+
+//     // Spec for fixslice::aes{128,192,256}_{encrypt,decrypt}, where aes_crypt is
+//     // either Aes::aes_encrypt or Aes::aes_decrypt. We follow cryptol-specs's
+//     // convention of calling this operation cipher instead of encrypt/decrypt, to
+//     // avoid confusion with the toplevel encrypt/decrypt which includes key
+//     // expansion.
+//     let cipher_spec
+//         (aes_crypt : Term /* FSRoundKeys -> BatchBlockBytes -> BatchBlockBytes */)
+//     = do {
+//       rkeys <- mir_fresh_cryptol_var "rkeys" {| Aes::FSRoundKeys |};
+//       rkeys_ref <- mir_ref_of (mir_term rkeys);
+//       block0 <- mir_fresh_cryptol_var "block0" {| Bitslice::BlockBytes |};
+//       block1 <- mir_fresh_cryptol_var "block1" {| Bitslice::BlockBytes |};
+//       block2 <- mir_fresh_cryptol_var "block2" {| Bitslice::BlockBytes |};
+//       block3 <- mir_fresh_cryptol_var "block3" {| Bitslice::BlockBytes |};
+//       blocks_ref <- mir_ref_of
+//         (mir_struct_value BatchBlocks [
+//           mir_array_value (mir_adt Block) [
+//             mir_struct_value Block [mir_term block0],
+//             mir_struct_value Block [mir_term block1],
+//             mir_struct_value Block [mir_term block2],
+//             mir_struct_value Block [mir_term block3]
+//           ]
+//         ]);
+//       mir_execute_func [rkeys_ref, blocks_ref];
+//       let output =
+//         eval_list {{ aes_crypt rkeys [block0, block1, block2, block3] }};
+//       mir_return
+//         (mir_struct_value BatchBlocks [
+//           mir_array_value (mir_adt Block)
+//             (map (\block -> mir_struct_value Block [mir_term block]) output)
+//         ]);
+//     };
+
+//     // Override for fixslice::aes{128,192,256}_encrypt.
+//     encipher_ov <-
+//       mir_verify m
+//         (str_concats ["aes::soft::fixslice::aes", key_size_str, "_encrypt"])
+//         (concats [
+//           add_round_key_ovs,
+//           mix_columns_ovs,
+//           [
+//             key_schedule_ov,
+//             bitslice_cipher_ov,
+//             inv_bitslice_ov,
+//             sub_bytes_cipher_ov,
+//             shift_rows_2_ov
+//           ]
+//         ])
+//         false
+//         (cipher_spec {{ Aes::aes_encrypt }})
+//         do {
+//           unfolding [
+//             "add_round_key",
+//             "sub_bytes",
+//             "mix_columns_0",
+//             "mix_columns_1",
+//             "mix_columns_2",
+//             "mix_columns_3",
+//             "shift_rows_2",
+//             "bitsliced"
+//           ];
+
+//           // For this spec, SAW generates goals of the form `rust_output @ i ==
+//           // cryptol_spec @ i` for i = 0 to 3. We cancel out the adjacent
+//           // inv_bitslice and bitslice coming from adjacent uses of bitsliced,
+//           // then push the @ through all the steps in the rust_output, until we
+//           // have @ directly applied to the round keys and the batch blocks input,
+//           // and all the AES operations are operating on a single block. Then we
+//           // cancel out the adjacent split/join and transpose/transpose so that
+//           // everything is operating on the cryptol-specs State. We also move
+//           // SubBytesNots in front of MixColumnsN so that it is next to
+//           // AddRoundKey.
+//           simplify
+//             (addsimps
+//               (concats [
+//                 thms_at_addRoundKey',
+//                 thms_at_stateTransformation_SubBytesNots_SubBytes,
+//                 thms_at_stateTransformation_ShiftRows2,
+//                 thms_at_stateTransformation_MixColumnsN,
+//                 thms_MixColumnsN_SubBytesNots,
+//                 [
+//                   thm_inv_bitslice_bitslice,
+//                   thm_split_join,
+//                   thm_transpose_transpose
+//                 ]
+//               ])
+//               empty_ss);
+
+//           // Expand the ShiftRows and InvShiftRows from MixColumnsN.
+//           unfolding ["MixColumns1", "MixColumns2", "MixColumns3"];
+
+//           // For each call to AddRoundKey, we want its first argument to
+//           // correspond exactly to the inverse adjustments performed by
+//           // Aes::invBitsliceAdjustKeySchedule on the matching round key. We can
+//           // do this by moving all the SubBytesNots from the blocks to the round
+//           // keys, then adjusting ShiftRows/InvShiftRows accordingly so that the
+//           // round keys get shifted as well. Note that the order of
+//           // simplifications matters here.
+//           simplify (addsimp thm_AddRoundKey_SubBytesNots empty_ss);
+//           simplify (addsimp thm_AddRoundKey_ShiftRows2 empty_ss);
+//           simplify
+//             (addsimps
+//               [thm_AddRoundKey_ShiftRows, thm_AddRoundKey_InvShiftRows]
+//               empty_ss);
+
+//           // Push the SubBytes under ShiftRows and InvShiftRows and cancel out
+//           // pairs of ShiftRows and InvShiftRows.
+//           simplify
+//             (addsimps [
+//               thm_SubBytes_ShiftRows,
+//               thm_SubBytes_InvShiftRows,
+//               thm_ShiftRows_InvShiftRows,
+//               thm_InvShiftRows_ShiftRows
+//             ] empty_ss);
+
+//           // The sequence of AES operations now exactly matches the spec from
+//           // cryptol-specs. The solver should be able to verify this quickly with
+//           // the operations kept uninterpreted.
+//           unint_z3 [
+//             "AddRoundKey",
+//             "SubBytes",
+//             "ShiftRows",
+//             "MixColumns"
+//           ];
+//         };
+
+
+
+//     // Override for fixslice::inv_sub_bytes.
+//     inv_sub_bytes_ov <-
+//       mir_verify m "aes::soft::fixslice::inv_sub_bytes" [] false
+//         (mutate_state_slice_spec {{ Aes::inv_sub_bytes }}) rme;
+
+//     // Override for fixslice::inv_shift_rows_2. Note that the Cryptol
+//     // specification is not Aes::inv_shift_rows_2, which is defined as
+//     // Aes::shift_rows_2, which in turn is a bitsliced state transformation of
+//     // applying ShiftRows twice. Instead, we use a custom definition of applying
+//     // InvShiftRows twice. These are equivalent, but the decipher proof needs it
+//     // to be InvShiftRows instead of ShiftRows, so instead of doing a rewrite
+//     // later, we just do the override with a different spec now. (We can't just
+//     // change the definition of Aes::inv_shift_rows_2 on the Cryptol side, because
+//     // the key schedule proofs also rely on it, and they take twice as long to
+//     // verify if we change Aes::inv_shift_rows_2 to this definition.)
+//     inv_shift_rows_2_ov <-
+//       mir_verify m "aes::soft::fixslice::inv_shift_rows_2" [] false
+//         (mutate_state_slice_spec {{
+//           Bitslice::bitsliced
+//             (Aes::stateTransformation
+//               (\state ->
+//                 Aes::Spec::InvShiftRows (Aes::Spec::InvShiftRows state)))
+//         }})
+//         rme;
+
+//     // Overrides for fixslice::inv_mix_columns_{0,1,2,3}.
+//     inv_mix_columns_ovs <- verify_mix_columns [
+//       ("inv_mix_columns_0", {{ Aes::inv_mix_columns_0 }}),
+//       ("inv_mix_columns_1", {{ Aes::inv_mix_columns_1 }}),
+//       ("inv_mix_columns_2", {{ Aes::inv_mix_columns_2 }}),
+//       ("inv_mix_columns_3", {{ Aes::inv_mix_columns_3 }})
+//     ];
+
+//     // The InvMixColumns{,1,2,3} Cryptol functions.
+//     let InvMixColumnsN = [
+//       {{ Aes::Spec::InvMixColumns }},
+//       {{ Aes::InvMixColumns1 }},
+//       {{ Aes::InvMixColumns2 }},
+//       {{ Aes::InvMixColumns3 }}
+//     ];
+
+//     // Rewrite rules to interchange SubBytesNots and InvMixColumns{0,1,2,3}.
+//     thms_SubBytesNots_InvMixColumnsN <-
+//       for InvMixColumnsN (\invMixColumns -> do {
+//         prove_print z3 {{
+//           \(state : Aes::Spec::State) ->
+//             Aes::SubBytesNots (invMixColumns state)
+//             == invMixColumns (Aes::SubBytesNots state)
+//         }};
+//       });
+
+//     // Rewrite rules to move @ inside
+//     // stateTransformation (InvSubBytes . SubBytesNots).
+//     thms_at_stateTransformation_InvSubBytes_SubBytesNots <-
+//       prove_at_stateTransformation {{
+//         \state -> Aes::Spec::InvSubBytes (Aes::SubBytesNots state)
+//       }};
+
+//     // Rewrite rules to move @ inside stateTransformation InvShiftRows2.
+//     thms_at_stateTransformation_InvShiftRows2 <-
+//       prove_at_stateTransformation {{
+//         \state -> Aes::Spec::InvShiftRows (Aes::Spec::InvShiftRows state)
+//       }};
+
+//     // Rewrite rules to move @ inside stateTransformation InvMixColumns{,1,2,3}.
+//     thms_at_stateTransformation_InvMixColumnsN <- do {
+//       nested <- for InvMixColumnsN prove_at_stateTransformation;
+//       return (concats nested);
+//     };
+
+//     // Rewrite rule to push SubBytesNots into the first argument of AddRoundKey.
+//     thm_SubBytesNots_AddRoundKey <- prove_print z3 {{
+//       \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+//         Aes::SubBytesNots (Aes::Spec::AddRoundKey w state)
+//         == Aes::Spec::AddRoundKey (Aes::SubBytesNots w) state
+//     }};
+
+//     // Rewrite rule to cancel out the ShiftRows and InvShiftRows around
+//     // AddRoundKey of InvSubBytes, by adding a ShiftRows to the round key.
+//     thm_ShiftRows_AddRoundKey_InvSubBytes_InvShiftRows <- prove_print z3 {{
+//       \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+//         Aes::Spec::ShiftRows
+//           (Aes::Spec::AddRoundKey w
+//             (Aes::Spec::InvSubBytes (Aes::Spec::InvShiftRows state)))
+//         == Aes::Spec::AddRoundKey
+//             (Aes::Spec::ShiftRows w)
+//             (Aes::Spec::InvSubBytes state)
+//     }};
+
+//     // Rewrite rule to change InvShiftRows2 of AddRoundKey of InvSubBytes of
+//     // ShiftRows into AddRoundKey of InvSubBytes of InvShiftRows, by adding a
+//     // ShiftRows2 to the round key.
+//     thm_InvShiftRows2_AddRoundKey_InvSubBytes_ShiftRows <- prove_print z3 {{
+//       \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+//         Aes::Spec::InvShiftRows
+//           (Aes::Spec::InvShiftRows
+//             (Aes::Spec::AddRoundKey w
+//               (Aes::Spec::InvSubBytes (Aes::Spec::ShiftRows state))))
+//         == Aes::Spec::AddRoundKey
+//             (Aes::Spec::ShiftRows (Aes::Spec::ShiftRows w))
+//             (Aes::Spec::InvSubBytes (Aes::Spec::InvShiftRows state))
+//     }};
+
+//     // Rewrite rule to change InvShiftRows of AddRoundKey of InvSubBytes into
+//     // AddRoundKey of InvSubBytes of InvShiftRows, by adding a InvShiftRows to the
+//     // round key.
+//     thm_InvShiftRows_AddRoundKey_InvSubBytes <- prove_print z3 {{
+//       \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+//         Aes::Spec::InvShiftRows
+//           (Aes::Spec::AddRoundKey w (Aes::Spec::InvSubBytes state))
+//         == Aes::Spec::AddRoundKey
+//             (Aes::Spec::InvShiftRows w)
+//             (Aes::Spec::InvSubBytes (Aes::Spec::InvShiftRows state))
+//     }};
+
+//     // Rewrite rule to interchange InvShiftRows and InvSubBytes.
+//     thm_InvShiftRows_InvSubBytes <- prove_print z3 {{
+//       \(state : Aes::Spec::State) ->
+//         Aes::Spec::InvShiftRows (Aes::Spec::InvSubBytes state)
+//         == Aes::Spec::InvSubBytes (Aes::Spec::InvShiftRows state)
+//     }};
+
+//     // Override for fixslice::aes{128,192,256}_decrypt.
+//     decipher_ov <-
+//       mir_verify m
+//         (str_concats ["aes::soft::fixslice::aes", key_size_str, "_decrypt"])
+//         (concats [
+//           add_round_key_ovs,
+//           inv_mix_columns_ovs,
+//           [
+//             key_schedule_ov,
+//             bitslice_cipher_ov,
+//             inv_bitslice_ov,
+//             inv_sub_bytes_ov,
+//             inv_shift_rows_2_ov
+//           ]
+//         ])
+//         false
+//         (cipher_spec {{ Aes::aes_decrypt }})
+//         do {
+//           unfolding [
+//             "add_round_key",
+//             "inv_sub_bytes",
+//             "inv_mix_columns_0",
+//             "inv_mix_columns_1",
+//             "inv_mix_columns_2",
+//             "inv_mix_columns_3",
+//             "inv_shift_rows_2",
+//             "bitsliced"
+//           ];
+
+//           // For this spec, SAW generates goals of the form `rust_output @ i ==
+//           // cryptol_spec @ i` for i = 0 to 3. We cancel out the adjacent
+//           // inv_bitslice and bitslice coming from adjacent uses of bitsliced,
+//           // then push the @ through all the steps in the rust_output, until we
+//           // have @ directly applied to the round keys and the batch blocks input,
+//           // and all the AES operations are operating on a single block. Then we
+//           // cancel out the adjacent split/join and transpose/transpose so that
+//           // everything is operating on the cryptol-specs State. We also move
+//           // SubBytesNots after MixColumnsN so that it is next to AddRoundKey, and
+//           // move InvShiftRows after InvSubBytes so that it matches the AES spec.
+//           simplify
+//             (addsimps
+//               (concats [
+//                 thms_at_addRoundKey',
+//                 thms_at_stateTransformation_InvSubBytes_SubBytesNots,
+//                 thms_at_stateTransformation_InvShiftRows2,
+//                 thms_at_stateTransformation_InvMixColumnsN,
+//                 thms_SubBytesNots_InvMixColumnsN,
+//                 [
+//                   thm_inv_bitslice_bitslice,
+//                   thm_split_join,
+//                   thm_transpose_transpose,
+//                   thm_InvShiftRows_InvSubBytes
+//                 ]
+//               ])
+//               empty_ss);
+
+//           // Expand the ShiftRows and InvShiftRows from InvMixColumnsN.
+//           unfolding ["InvMixColumns1", "InvMixColumns2", "InvMixColumns3"];
+
+//           // For each call to AddRoundKey, we want its first argument to
+//           // correspond exactly to the inverse adjustments performed by
+//           // Aes::invBitsliceAdjustKeySchedule on the matching round key. We can
+//           // do this by moving all the SubBytesNots from the blocks to the round
+//           // keys, then adjusting ShiftRows/InvShiftRows accordingly so that the
+//           // round keys get shifted as well. Note that the order of
+//           // simplifications matters here.
+//           simplify (addsimp thm_SubBytesNots_AddRoundKey empty_ss);
+//           simplify
+//             (addsimp
+//               thm_InvShiftRows2_AddRoundKey_InvSubBytes_ShiftRows
+//               empty_ss);
+//           simplify
+//             (addsimps [
+//               thm_ShiftRows_AddRoundKey_InvSubBytes_InvShiftRows,
+//               thm_InvShiftRows_AddRoundKey_InvSubBytes
+//             ] empty_ss);
+
+//           // The sequence of AES operations now exactly matches the spec from
+//           // cryptol-specs. The solver should be able to verify this quickly with
+//           // the operations kept uninterpreted.
+//           unint_z3 [
+//             "AddRoundKey",
+//             "InvSubBytes",
+//             "InvShiftRows",
+//             "InvMixColumns"
+//           ];
+//         };
+
+//     return {
+//       key_schedule_ov = key_schedule_ov,
+//       encipher_ov = encipher_ov,
+//       decipher_ov = decipher_ov
+//     };
+//   };
+
+//   // Spec for fixslice::bitslice, as used in aes128_key_schedule.
+//   let bitslice_key_128_spec = do {
+//     rkeys_init <- mir_fresh_cryptol_var "rkeys_init" {| Aes128::FSRoundKeys |};
+//     rkeys_ref <- mir_ref_of_mut (mir_term rkeys_init);
+//     key <- mir_fresh_cryptol_var "key" {| Aes128::KeyBytes |};
+//     key_ref <- mir_ref_of (mir_term key);
+//     mir_execute_func [
+//       mir_slice_range_value rkeys_ref 0 8,
+//       mir_slice_value key_ref,
+//       mir_slice_value key_ref,
+//       mir_slice_value key_ref,
+//       mir_slice_value key_ref
+//     ];
+//     mir_points_to rkeys_ref (mir_term {{
+//       Bitslice::bitslice [key, key, key, key] # drop`{8} rkeys_init
+//     }});
+//   };
+
+//   bitslice_key_128_ov <-
+//     mir_verify m "aes::soft::fixslice::bitslice" [] false
+//       bitslice_key_128_spec rme;
+
+//   let aes128 = {
+//     Aes = Aes128,
+//     KeySchedule = AesKeySchedule128,
+//     bitslice_key_ovs = [bitslice_key_128_ov],
+//     // Keep SBox uninterpreted when verifying aes128_key_schedule. If SBox is
+//     // expanded, it runs for a very long time (longer than verifying
+//     // aes192_key_schedule with SBox expanded, for some reason).
+//     key_schedule_proof = unint_z3 ["SBox"]
+//   };
+
+//   // Spec for fixslice::bitslice, as used in the first call in
+//   // aes192_key_schedule.
+//   let bitslice_key_192_front_spec = do {
+//     rkeys_init <- mir_fresh_cryptol_var "rkeys_init" {| Aes192::FSRoundKeys |};
+//     rkeys_ref <- mir_ref_of_mut (mir_term rkeys_init);
+//     key <- mir_fresh_cryptol_var "key" {| Aes192::KeyBytes |};
+//     key_ref <- mir_ref_of (mir_term key);
+//     mir_execute_func [
+//       mir_slice_range_value rkeys_ref 0 8,
+//       mir_slice_range_value key_ref 0 16,
+//       mir_slice_range_value key_ref 0 16,
+//       mir_slice_range_value key_ref 0 16,
+//       mir_slice_range_value key_ref 0 16
+//     ];
+//     mir_points_to rkeys_ref (mir_term {{
+//       Bitslice::bitslice [take key, take key, take key, take key]
+//       # drop`{8} rkeys_init
+//     }});
+//   };
+
+//   bitslice_key_192_front_ov <-
+//     mir_verify m "aes::soft::fixslice::bitslice" [] false
+//       bitslice_key_192_front_spec rme;
+
+//   // Spec for fixslice::bitslice, as used in the second call in
+//   // aes192_key_schedule.
+//   let bitslice_key_192_back_spec = do {
+//     tmp_init <- mir_fresh_cryptol_var "tmp_init" {| Bitslice::FSState |};
+//     tmp_ref <- mir_ref_of_mut (mir_term tmp_init);
+//     key <- mir_fresh_cryptol_var "key" {| Aes192::KeyBytes |};
+//     key_ref <- mir_ref_of (mir_term key);
+//     mir_execute_func [
+//       mir_slice_value tmp_ref,
+//       mir_slice_range_value key_ref 8 24,
+//       mir_slice_range_value key_ref 8 24,
+//       mir_slice_range_value key_ref 8 24,
+//       mir_slice_range_value key_ref 8 24
+//     ];
+//     mir_points_to tmp_ref (mir_term {{
+//       Bitslice::bitslice [drop key, drop key, drop key, drop key]
+//     }});
+//   };
+
+//   bitslice_key_192_back_ov <-
+//     mir_verify m "aes::soft::fixslice::bitslice" [] false
+//       bitslice_key_192_back_spec rme;
+
+//   let aes192 = {
+//     Aes = Aes192,
+//     KeySchedule = AesKeySchedule192,
+//     bitslice_key_ovs = [bitslice_key_192_front_ov, bitslice_key_192_back_ov],
+//     // For some reason keeping SBox uninterpreted doesn't work for the
+//     // aes192_key_schedule proof, so we use regular z3.
+//     key_schedule_proof = z3
+//   };
+
+//   // Spec for fixslice::bitslice, as used in the first call in
+//   // aes256_key_schedule.
+//   let bitslice_key_256_front_spec = do {
+//     rkeys_init <- mir_fresh_cryptol_var "rkeys_init" {| Aes256::FSRoundKeys |};
+//     rkeys_ref <- mir_ref_of_mut (mir_term rkeys_init);
+//     key <- mir_fresh_cryptol_var "key" {| Aes256::KeyBytes |};
+//     key_ref <- mir_ref_of (mir_term key);
+//     mir_execute_func [
+//       mir_slice_range_value rkeys_ref 0 8,
+//       mir_slice_range_value key_ref 0 16,
+//       mir_slice_range_value key_ref 0 16,
+//       mir_slice_range_value key_ref 0 16,
+//       mir_slice_range_value key_ref 0 16
+//     ];
+//     mir_points_to rkeys_ref (mir_term {{
+//       Bitslice::bitslice [take key, take key, take key, take key]
+//       # drop`{8} rkeys_init
+//     }});
+//   };
+
+//   bitslice_key_256_front_ov <-
+//     mir_verify m "aes::soft::fixslice::bitslice" [] false
+//       bitslice_key_256_front_spec rme;
+
+//   // Spec for fixslice::bitslice, as used in the second call in
+//   // aes256_key_schedule.
+//   let bitslice_key_256_back_spec = do {
+//     rkeys_init <- mir_fresh_cryptol_var "rkeys_init" {| Aes256::FSRoundKeys |};
+//     rkeys_ref <- mir_ref_of_mut (mir_term rkeys_init);
+//     key <- mir_fresh_cryptol_var "key" {| Aes256::KeyBytes |};
+//     key_ref <- mir_ref_of (mir_term key);
+//     mir_execute_func [
+//       mir_slice_range_value rkeys_ref 8 16,
+//       mir_slice_range_value key_ref 16 32,
+//       mir_slice_range_value key_ref 16 32,
+//       mir_slice_range_value key_ref 16 32,
+//       mir_slice_range_value key_ref 16 32
+//     ];
+//     mir_points_to rkeys_ref (mir_term {{
+//         take`{8} rkeys_init
+//         # Bitslice::bitslice [drop key, drop key, drop key, drop key]
+//         # drop`{16} rkeys_init
+//     }});
+//   };
+
+//   bitslice_key_256_back_ov <-
+//     mir_verify m "aes::soft::fixslice::bitslice" [] false
+//       bitslice_key_256_back_spec rme;
+
+//   let aes256 = {
+//     Aes = Aes256,
+//     KeySchedule = AesKeySchedule256,
+//     bitslice_key_ovs = [bitslice_key_256_front_ov, bitslice_key_256_back_ov],
+//     // For some reason keeping SBox uninterpreted doesn't work for the
+//     // aes256_key_schedule proof, so we use regular z3.
+//     key_schedule_proof = z3
+//   };
+
+//   return {
+//     verify_size = verify_size,
+//     aes128 = aes128,
+//     aes192 = aes192,
+//     aes256 = aes256
+//   };
+// };
+
+// enable_experimental;
+
+// include_once "../utils/list.saw";
+// include_once "../utils/typenum.saw";
+
+// import AesVerif::Bitslice;
+// import AesVerif::ProofUtils;
+
+// // The Cryptol modules for specific sizes of AES will be abstracted over as
+// // `CryptolModule`s in this script, so we need to import them with cryptol_load.
+
+// Aes128 <- cryptol_load "AesVerif/Aes128.cry";
+// KeySchedule128 <- cryptol_load "AesVerif/KeySchedule128.cry";
+
+// Aes192 <- cryptol_load "AesVerif/Aes192.cry";
+// KeySchedule192 <- cryptol_load "AesVerif/KeySchedule192.cry";
+
+// Aes256 <- cryptol_load "AesVerif/Aes256.cry";
+// KeySchedule256 <- cryptol_load "AesVerif/KeySchedule256.cry";
+
+// m <- mir_load_module "../target/aes_verif.linked-mir.json";
+
+// // Rust types used by functions in the aes crate.
+// let U = typenum_uint m;
+// let GenericArray = mir_find_adt m "generic_array::GenericArray";
+// let Block = GenericArray [mir_u8, mir_adt (U 16)];
+// let BatchBlocks = GenericArray [mir_adt Block, mir_adt (U 4)];
+
+// // Spec for fixslice::bitslice, as used in aes{128,192,256}_{encrypt,decrypt}.
+// let bitslice_cipher_spec = do {
+//   output_init <- mir_fresh_cryptol_var "output_init" {| FSState |};
+//   output_ref <- mir_ref_of_mut (mir_term output_init);
+//   block0 <- mir_fresh_cryptol_var "block0" {| BlockBytes |};
+//   block1 <- mir_fresh_cryptol_var "block1" {| BlockBytes |};
+//   block2 <- mir_fresh_cryptol_var "block2" {| BlockBytes |};
+//   block3 <- mir_fresh_cryptol_var "block3" {| BlockBytes |};
+//   blocks_ref <- mir_ref_of (mir_array_value (mir_adt Block) [
+//     mir_struct_value Block [mir_term block0],
+//     mir_struct_value Block [mir_term block1],
+//     mir_struct_value Block [mir_term block2],
+//     mir_struct_value Block [mir_term block3]
+//   ]);
+//   mir_execute_func [
+//     mir_slice_value output_ref,
+//     mir_slice_value (mir_field_ref (mir_elem_ref blocks_ref 0) "data"),
+//     mir_slice_value (mir_field_ref (mir_elem_ref blocks_ref 1) "data"),
+//     mir_slice_value (mir_field_ref (mir_elem_ref blocks_ref 2) "data"),
+//     mir_slice_value (mir_field_ref (mir_elem_ref blocks_ref 3) "data")
+//   ];
+//   mir_points_to output_ref (mir_term {{
+//     bitslice [block0, block1, block2, block3]
+//   }});
+// };
+
+// bitslice_cipher_ov <-
+//   mir_verify m "aes::soft::fixslice::bitslice" [] false
+//     bitslice_cipher_spec rme;
+
+// // Spec for fixslice::inv_bitslice.
+// let inv_bitslice_spec = do {
+//   input <- mir_fresh_cryptol_var "input" {| FSState |};
+//   input_ref <- mir_ref_of (mir_term input);
+//   mir_execute_func [mir_slice_value input_ref];
+//   let output = {{ inv_bitslice input }};
+//   mir_return (mir_struct_value BatchBlocks [
+//     mir_array_value (mir_adt Block) [
+//       mir_struct_value Block [mir_term {{ output @ 0 }}],
+//       mir_struct_value Block [mir_term {{ output @ 1 }}],
+//       mir_struct_value Block [mir_term {{ output @ 2 }}],
+//       mir_struct_value Block [mir_term {{ output @ 3 }}]
+//     ]
+//   ]);
+// };
+
+// inv_bitslice_ov <-
+//   mir_verify m "aes::soft::fixslice::inv_bitslice" [] false
+//     inv_bitslice_spec rme;
+
+// // Rewrite rule to cancel out inv_bitslice of bitslice.
+// thm_inv_bitslice_bitslice <-
+//   prove_print rme {{ \x -> inv_bitslice (bitslice x) == x }};
+
+// // Spec for functions which take a State by mutable reference and mutate it
+// // according to the given Cryptol function.
+// let mutate_state_ref_spec (cry_fun : Term /* FSState -> FSState */) = do {
+//   state_init <- mir_fresh_cryptol_var "state_init" {| FSState |};
+//   state_ref <- mir_ref_of_mut (mir_term state_init);
+//   mir_execute_func [state_ref];
+//   mir_points_to state_ref (mir_term {{ cry_fun state_init }});
+// };
+
+// // Spec for functions which take a State as a mutable slice and mutate it
+// // according to the given Cryptol function.
+// let mutate_state_slice_spec (cry_fun : Term /* FSState -> FSState */) = do {
+//   state_init <- mir_fresh_cryptol_var "state_init" {| FSState |};
+//   state_ref <- mir_ref_of_mut (mir_term state_init);
+//   mir_execute_func [mir_slice_value state_ref];
+//   mir_points_to state_ref (mir_term {{ cry_fun state_init }});
+// };
+
+// // Given a reference to an array of bitsliced round keys, return a slice of the
+// // round key for the given round (starting from 0).
+// let slice_round (round : Int) (arr_ref : MIRValue) : MIRValue =
+//   mir_slice_range_value arr_ref
+//     (eval_size {| round * 8 |})
+//     (eval_size {| (round + 1) * 8 |});
+
+// // Verification steps which need to be performed for each key size. This
+// // function will be called on the Aes{128,192,256} and KeySchedule{128,192,256}
+// // modules for each key size. There are some steps that are different between
+// // the key sizes; these parts are defined by the caller for each size and passed
+// // in as additional arguments.
+// let verify_aes_size
+//     // The Aes{128,192,256} module for this key size.
+//     (Aes : CryptolModule)
+//     // The KeySchedule{128,192,256} module for this key size.
+//     (KeySchedule : CryptolModule)
+//     // The overrides for the bitslice function as used in the key schedule
+//     // function.
+//     (bitslice_key_ovs : [MIRSpec])
+//     // The proof tactic for verifying the key schedule function.
+//     (key_schedule_proof : ProofScript ())
+// = do {
+
+//   // Key size as a string.
+//   let key_size_str = show {| Aes::Spec::KeySize |};
+
+//   print (str_concat "Verifying AES-" key_size_str);
+
+//   // Integers from 0 through the number of rounds, inclusive, which can be used
+//   // as indices into the bitsliced round keys array with slice_round and
+//   // sliceRound/modifyRound. Note that the length of this list is one more than
+//   // the number of rounds.
+//   let rounds = map eval_int (eval_list {{ [0..Aes::Spec::Nr : [64]] }});
+
+//   // Override for fixslice::sub_bytes, as used in
+//   // aes{128,192,256}_{encrypt_decrypt} and aes192_key_schedule.
+//   sub_bytes_cipher_ov <-
+//     mir_verify m "aes::soft::fixslice::sub_bytes" [] false
+//       (mutate_state_slice_spec {{ Aes::sub_bytes }}) rme;
+
+//   // Override for fixslice::sub_bytes_nots, as used in aes192_key_schedule
+//   // inside the main loop, when it is called on a slice of tmp: [u64; 8].
+//   sub_bytes_nots_tmp_ov <-
+//     mir_verify m "aes::soft::fixslice::sub_bytes_nots" [] false
+//       (mutate_state_slice_spec {{ Aes::sub_bytes_nots }}) rme;
+
+//   // Override for fixslice::shift_rows_2, as used in aes{128,256}_encrypt.
+//   shift_rows_2_ov <-
+//     mir_verify m "aes::soft::fixslice::shift_rows_2" [] false
+//       (mutate_state_slice_spec {{ Aes::shift_rows_2 }}) rme;
+
+//   // Spec for functions which take a mutable slice of a round key from the
+//   // bitsliced round keys array and mutate it according to the given Cryptol
+//   // function.
+//   let mutate_rkeys_slice_spec
+//       (round : Int)
+//       (cry_fun : Term /* FSState -> FSState */)
+//   = do {
+//     rkeys_init <- mir_fresh_cryptol_var "rkeys_init" {| Aes::FSRoundKeys |};
+//     rkeys_ref <- mir_ref_of_mut (mir_term rkeys_init);
+//     mir_execute_func [slice_round round rkeys_ref];
+//     mir_points_to rkeys_ref (mir_term {{
+//       modifyRound`{round} cry_fun rkeys_init
+//     }});
+//   };
+
+//   // Verify a function which takes a mutable slice of a round key from the
+//   // bitsliced round keys array and mutates it according to the given Cryptol
+//   // function, and obtain overrides for it for all round keys in the bitsliced
+//   // round key array.
+//   let verify_mutate_rkeys_slice
+//       (rust_fun : String)
+//       (cry_fun : Term /* FSState -> FSState */)
+//       : TopLevel [MIRSpec]
+//   = do {
+//     for rounds (\i -> do {
+//       mir_verify m rust_fun [] false (mutate_rkeys_slice_spec i cry_fun) rme;
+//     });
+//   };
+
+//   // Overrides for fixslice::sub_bytes, as used in aes{128,256}_key_schedule.
+//   sub_bytes_key_ovs <-
+//     verify_mutate_rkeys_slice
+//       "aes::soft::fixslice::sub_bytes" {{ Aes::sub_bytes }};
+
+//   // Overrides for fixslice::sub_bytes_nots, as used in
+//   // aes{128,256}_key_schedule, and in aes192_key_schedule at the end.
+//   sub_bytes_nots_key_ovs <-
+//     verify_mutate_rkeys_slice
+//       "aes::soft::fixslice::sub_bytes_nots" {{ Aes::sub_bytes_nots }};
+
+//   // Overrides for fixslice::inv_shift_rows_1, as used in
+//   // aes{128,192,256}_key_schedule.
+//   inv_shift_rows_1_key_ovs <-
+//     verify_mutate_rkeys_slice
+//       "aes::soft::fixslice::inv_shift_rows_1" {{ Aes::inv_shift_rows_1 }};
+
+//   // Overrides for fixslice::inv_shift_rows_2, as used in
+//   // aes{128,192,256}_key_schedule.
+//   inv_shift_rows_2_key_ovs <-
+//     verify_mutate_rkeys_slice
+//       "aes::soft::fixslice::inv_shift_rows_2" {{ Aes::inv_shift_rows_2 }};
+
+//   // Overrides for fixslice::inv_shift_rows_3, as used in
+//   // aes{128,192,256}_key_schedule.
+//   inv_shift_rows_3_key_ovs <-
+//     verify_mutate_rkeys_slice
+//       "aes::soft::fixslice::inv_shift_rows_3" {{ Aes::inv_shift_rows_3 }};
+
+//   // Spec for fixslice::aes{128,192,256}_key_schedule.
+//   let key_schedule_spec = do {
+//     key <- mir_fresh_cryptol_var "key" {| Aes::KeyBytes |};
+//     key_ref <- mir_ref_of (mir_term key);
+//     mir_execute_func [key_ref];
+//     mir_return (mir_term {{ KeySchedule::key_schedule key }});
+//   };
+
+//   print "Verifying key schedule might take a while";
+//   // On a M4 Mac, this takes ~1 min for AES-128, ~5 min for AES-192, and ~9 min
+//   // for AES-256.
+
+//   // We don't actually need all of these overrides for each size (128 and 256
+//   // don't need sub_bytes_cipher_ov and sub_bytes_nots_tmp_ov, while 192 doesn't
+//   // need sub_bytes_key_ovs), but it's simpler to just pass all of them.
+//   key_schedule_ov <- mir_verify m
+//     (str_concats ["aes::soft::fixslice::aes", key_size_str, "_key_schedule"])
+//     (concats [
+//       bitslice_key_ovs,
+//       sub_bytes_key_ovs,
+//       inv_shift_rows_1_key_ovs,
+//       inv_shift_rows_2_key_ovs,
+//       inv_shift_rows_3_key_ovs,
+//       sub_bytes_nots_key_ovs,
+//       [sub_bytes_cipher_ov, sub_bytes_nots_tmp_ov]
+//     ])
+//     false key_schedule_spec key_schedule_proof;
+
+//   // Spec for fixslice::add_round_key for the given round.
+//   let add_round_key_spec (round : Int) = do {
+//     state_init <- mir_fresh_cryptol_var "state_init" {| FSState |};
+//     state_ref <- mir_ref_of_mut (mir_term state_init);
+//     rkeys <- mir_fresh_cryptol_var "rkeys" {| Aes::FSRoundKeys |};
+//     rkeys_ref <- mir_ref_of (mir_term rkeys);
+//     mir_execute_func [state_ref, slice_round round rkeys_ref];
+//     mir_points_to state_ref (mir_term {{
+//       Aes::add_round_key state_init (sliceRound`{round} rkeys)
+//     }});
+//   };
+
+//   // Overrides for fixslice::add_round_key for all rounds.
+//   add_round_key_ovs <-
+//     for rounds (\i -> do {
+//       mir_verify m "aes::soft::fixslice::add_round_key" [] false
+//         (add_round_key_spec i) rme;
+//     });
+
+//   // Given a series of Rust functions which take a State by mutable reference,
+//   // verify that each one mutates the State according to the Cryptol function
+//   // that it is paired with, and return overrides for all of the functions. The
+//   // Rust function names do not need to be prefixed with aes::soft::fixslice::.
+//   let verify_mix_columns
+//       (rust_and_cry_funs : [(String, Term /* FSState -> FSState */)])
+//       : TopLevel [MIRSpec]
+//   = do {
+//     for rust_and_cry_funs (\(rust_fun, cry_fun) -> do {
+//       mir_verify m (str_concat "aes::soft::fixslice::" rust_fun) [] false
+//         (mutate_state_ref_spec cry_fun) rme;
+//     });
+//   };
+
+//   // Overrides for fixslice::mix_columns_{0,1,2,3}.
+//   mix_columns_ovs <- verify_mix_columns [
+//     ("mix_columns_0", {{ Aes::mix_columns_0 }}),
+//     ("mix_columns_1", {{ Aes::mix_columns_1 }}),
+//     ("mix_columns_2", {{ Aes::mix_columns_2 }}),
+//     ("mix_columns_3", {{ Aes::mix_columns_3 }})
+//   ];
+
+//   // The MixColumns{,1,2,3} Cryptol functions.
+//   let MixColumnsN = [
+//     {{ Aes::Spec::MixColumns }},
+//     {{ Aes::MixColumns1 }},
+//     {{ Aes::MixColumns2 }},
+//     {{ Aes::MixColumns3 }}
+//   ];
+
+//   // Rewrite rules to interchange MixColumns{,1,2,3} and SubBytesNots.
+//   thms_MixColumnsN_SubBytesNots <-
+//     for MixColumnsN (\mixColumns -> do {
+//       prove_print z3 {{
+//         \(state : Aes::Spec::State) ->
+//           mixColumns (Aes::SubBytesNots state)
+//           == Aes::SubBytesNots (mixColumns state)
+//       }};
+//     });
+
+//   // Rewrite rules to move @ inside AddRoundKey.
+//   thms_at_addRoundKey' <-
+//     for (eval_list {{ [0..3 : [2]] }}) (\i -> do {
+//       // We have to evaluate i here to a SAWScript Int then demote it back to a
+//       // Term in the Cryptol expression, so that its SAWCore representation is a
+//       // constant and the rewrite rule will fire.
+//       let i' = eval_int i;
+//       prove_print z3 {{
+//         \(rkey : FSState) (blocks : BatchBlockBytes) ->
+//           Aes::addRoundKey' rkey blocks @ `i'
+//           == join
+//               (transpose
+//                 (Aes::Spec::AddRoundKey
+//                   (transpose (split (inv_bitslice rkey @ `i')))
+//                   (transpose (split (blocks @ `i')))))
+//       }};
+//     });
+
+//   // Given a state transformation function f, prove a rewrite rule to move @
+//   // inside stateTransformation f. This gets rid of the stateTransformation
+//   // because the function now only needs to operate on a single block instead of
+//   // a batch.
+//   let prove_at_stateTransformation
+//       (f : Term /* Aes::Spec::State -> Aes::Spec::State */)
+//       : TopLevel [Theorem]
+//   = do {
+//     for (eval_list {{ [0..3 : [2]] }}) (\i -> do {
+//       // We have to evaluate i here to a SAWScript Int then demote it back to a
+//       // Term in the Cryptol expression, so that its SAWCore representation is a
+//       // constant and the rewrite rule will fire.
+//       let i' = eval_int i;
+//       prove_print z3 {{
+//         \(blocks : BatchBlockBytes) ->
+//           Aes::stateTransformation f blocks @ `i'
+//           == join (transpose (f (transpose (split (blocks @ `i')))))
+//       }};
+//     });
+//   };
+
+//   // Rewrite rules to move @ inside
+//   // stateTransformation (SubBytesNots . SubBytes).
+//   thms_at_stateTransformation_SubBytesNots_SubBytes <-
+//     prove_at_stateTransformation {{
+//       \state -> Aes::SubBytesNots (Aes::Spec::SubBytes state)
+//     }};
+
+//   // Rewrite rules to move @ inside stateTransformation ShiftRows2.
+//   thms_at_stateTransformation_ShiftRows2 <-
+//     prove_at_stateTransformation {{
+//       \state -> Aes::Spec::ShiftRows (Aes::Spec::ShiftRows state)
+//     }};
+
+//   // Rewrite rules to move @ inside stateTransformation MixColumns{,1,2,3}.
+//   thms_at_stateTransformation_MixColumnsN <- do {
+//     nested <- for MixColumnsN prove_at_stateTransformation;
+//     return (concats nested);
+//   };
+
+//   // Rewrite rule to cancel out split of join.
+//   thm_split_join <- prove_print z3 {{
+//     \(state : Aes::Spec::State) -> split (join state) == state
+//   }};
+
+//   // Rewrite rule to cancel out transpose of transpose.
+//   thm_transpose_transpose <- prove_print z3 {{
+//     \(state : Aes::Spec::State) -> transpose (transpose state) == state
+//   }};
+
+//   // Rewrite rule to move SubBytesNots from the second argument to the first
+//   // argument of AddRoundKey.
+//   thm_AddRoundKey_SubBytesNots <- prove_print z3 {{
+//     \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+//       Aes::Spec::AddRoundKey w (Aes::SubBytesNots state)
+//       == Aes::Spec::AddRoundKey (Aes::SubBytesNots w) state
+//   }};
+
+//   // Rewrite rule to pull InvShiftRows in front of AddRoundKey, adding a
+//   // ShiftRows to the round key.
+//   thm_AddRoundKey_InvShiftRows <- prove_print z3 {{
+//     \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+//       Aes::Spec::AddRoundKey w (Aes::Spec::InvShiftRows state)
+//       == Aes::Spec::InvShiftRows
+//           (Aes::Spec::AddRoundKey (Aes::Spec::ShiftRows w) state)
+//   }};
+
+//   // Rewrite rule to pull ShiftRows2 in front of AddRoundKey, adding a
+//   // ShiftRows2 to the round key.
+//   thm_AddRoundKey_ShiftRows2 <- prove_print z3 {{
+//     \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+//       Aes::Spec::AddRoundKey w
+//         (Aes::Spec::ShiftRows (Aes::Spec::ShiftRows state))
+//       == Aes::Spec::ShiftRows
+//           (Aes::Spec::ShiftRows
+//             (Aes::Spec::AddRoundKey
+//               (Aes::Spec::ShiftRows (Aes::Spec::ShiftRows w))
+//               state))
+//   }};
+
+//   // Rewrite rule to pull ShiftRows in front of AddRoundKey, adding a
+//   // InvShiftRows to the round key.
+//   thm_AddRoundKey_ShiftRows <- prove_print z3 {{
+//     \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+//       Aes::Spec::AddRoundKey w (Aes::Spec::ShiftRows state)
+//       == Aes::Spec::ShiftRows
+//           (Aes::Spec::AddRoundKey (Aes::Spec::InvShiftRows w) state)
+//   }};
+
+//   // Rewrite rule to interchange SubBytes and InvShiftRows.
+//   thm_SubBytes_InvShiftRows <- prove_print z3 {{
+//     \(state : Aes::Spec::State) ->
+//       Aes::Spec::SubBytes (Aes::Spec::InvShiftRows state)
+//       == Aes::Spec::InvShiftRows (Aes::Spec::SubBytes state)
+//   }};
+
+//   // Rewrite rule to interchange SubBytes and ShiftRows.
+//   thm_SubBytes_ShiftRows <- prove_print z3 {{
+//     \(state : Aes::Spec::State) ->
+//       Aes::Spec::SubBytes (Aes::Spec::ShiftRows state)
+//       == Aes::Spec::ShiftRows (Aes::Spec::SubBytes state)
+//   }};
+
+//   // Rewrite rule to cancel out ShiftRows of InvShiftRows.
+//   thm_ShiftRows_InvShiftRows <- prove_print z3 {{
+//     \(state : Aes::Spec::State) ->
+//       Aes::Spec::ShiftRows (Aes::Spec::InvShiftRows state) == state
+//   }};
+
+//   // Rewrite rule to cancel out InvShiftRows of ShiftRows.
+//   thm_InvShiftRows_ShiftRows <- prove_print z3 {{
+//     Aes::Spec::shiftRowsInverts
+//   }};
+
+//   // Spec for fixslice::aes{128,192,256}_{encrypt,decrypt}, where aes_crypt is
+//   // either Aes::aes_encrypt or Aes::aes_decrypt. We follow cryptol-specs's
+//   // convention of calling this operation cipher instead of encrypt/decrypt, to
+//   // avoid confusion with the toplevel encrypt/decrypt which includes key
+//   // expansion.
+//   let cipher_spec
+//       (aes_crypt : Term /* FSRoundKeys -> BatchBlockBytes -> BatchBlockBytes */)
+//   = do {
+//     rkeys <- mir_fresh_cryptol_var "rkeys" {| Aes::FSRoundKeys |};
+//     rkeys_ref <- mir_ref_of (mir_term rkeys);
+//     block0 <- mir_fresh_cryptol_var "block0" {| BlockBytes |};
+//     block1 <- mir_fresh_cryptol_var "block1" {| BlockBytes |};
+//     block2 <- mir_fresh_cryptol_var "block2" {| BlockBytes |};
+//     block3 <- mir_fresh_cryptol_var "block3" {| BlockBytes |};
+//     blocks_ref <- mir_ref_of
+//       (mir_struct_value BatchBlocks [
+//         mir_array_value (mir_adt Block) [
+//           mir_struct_value Block [mir_term block0],
+//           mir_struct_value Block [mir_term block1],
+//           mir_struct_value Block [mir_term block2],
+//           mir_struct_value Block [mir_term block3]
+//         ]
+//       ]);
+//     mir_execute_func [rkeys_ref, blocks_ref];
+//     let output =
+//       eval_list {{ aes_crypt rkeys [block0, block1, block2, block3] }};
+//     mir_return
+//       (mir_struct_value BatchBlocks [
+//         mir_array_value (mir_adt Block)
+//           (map (\block -> mir_struct_value Block [mir_term block]) output)
+//       ]);
+//   };
+
+//   // Override for fixslice::aes{128,192,256}_encrypt.
+//   encipher_ov <-
+//     mir_verify m
+//       (str_concats ["aes::soft::fixslice::aes", key_size_str, "_encrypt"])
+//       (concats [
+//         add_round_key_ovs,
+//         mix_columns_ovs,
+//         [
+//           key_schedule_ov,
+//           bitslice_cipher_ov,
+//           inv_bitslice_ov,
+//           sub_bytes_cipher_ov,
+//           shift_rows_2_ov
+//         ]
+//       ])
+//       false
+//       (cipher_spec {{ Aes::aes_encrypt }})
+//       do {
+//         unfolding [
+//           "add_round_key",
+//           "sub_bytes",
+//           "mix_columns_0",
+//           "mix_columns_1",
+//           "mix_columns_2",
+//           "mix_columns_3",
+//           "shift_rows_2",
+//           "bitsliced"
+//         ];
+
+//         // For this spec, SAW generates goals of the form `rust_output @ i ==
+//         // cryptol_spec @ i` for i = 0 to 3. We cancel out the adjacent
+//         // inv_bitslice and bitslice coming from adjacent uses of bitsliced,
+//         // then push the @ through all the steps in the rust_output, until we
+//         // have @ directly applied to the round keys and the batch blocks input,
+//         // and all the AES operations are operating on a single block. Then we
+//         // cancel out the adjacent split/join and transpose/transpose so that
+//         // everything is operating on the cryptol-specs State. We also move
+//         // SubBytesNots in front of MixColumnsN so that it is next to
+//         // AddRoundKey.
+//         simplify
+//           (addsimps
+//             (concats [
+//               thms_at_addRoundKey',
+//               thms_at_stateTransformation_SubBytesNots_SubBytes,
+//               thms_at_stateTransformation_ShiftRows2,
+//               thms_at_stateTransformation_MixColumnsN,
+//               thms_MixColumnsN_SubBytesNots,
+//               [
+//                 thm_inv_bitslice_bitslice,
+//                 thm_split_join,
+//                 thm_transpose_transpose
+//               ]
+//             ])
+//             empty_ss);
+
+//         // Expand the ShiftRows and InvShiftRows from MixColumnsN.
+//         unfolding ["MixColumns1", "MixColumns2", "MixColumns3"];
+
+//         // For each call to AddRoundKey, we want its first argument to
+//         // correspond exactly to the inverse adjustments performed by
+//         // Aes::invBitsliceAdjustKeySchedule on the matching round key. We can
+//         // do this by moving all the SubBytesNots from the blocks to the round
+//         // keys, then adjusting ShiftRows/InvShiftRows accordingly so that the
+//         // round keys get shifted as well. Note that the order of
+//         // simplifications matters here.
+//         simplify (addsimp thm_AddRoundKey_SubBytesNots empty_ss);
+//         simplify (addsimp thm_AddRoundKey_ShiftRows2 empty_ss);
+//         simplify
+//           (addsimps
+//             [thm_AddRoundKey_ShiftRows, thm_AddRoundKey_InvShiftRows]
+//             empty_ss);
+
+//         // Push the SubBytes under ShiftRows and InvShiftRows and cancel out
+//         // pairs of ShiftRows and InvShiftRows.
+//         simplify
+//           (addsimps [
+//             thm_SubBytes_ShiftRows,
+//             thm_SubBytes_InvShiftRows,
+//             thm_ShiftRows_InvShiftRows,
+//             thm_InvShiftRows_ShiftRows
+//           ] empty_ss);
+
+//         // The sequence of AES operations now exactly matches the spec from
+//         // cryptol-specs. The solver should be able to verify this quickly with
+//         // the operations kept uninterpreted.
+//         unint_z3 [
+//           "AddRoundKey",
+//           "SubBytes",
+//           "ShiftRows",
+//           "MixColumns"
+//         ];
+//       };
+
+//   // Spec for aes_verif::toplevel_{encrypt,decrypt}_block_{128,192,256}, where
+//   // toplevel_crypt is either Aes::toplevel_encrypt_block or
+//   // Aes::toplevel_decrypt_block.
+//   let toplevel_crypt_spec
+//       (toplevel_crypt : Term /* KeyBytes -> BlockBytes -> BlockBytes */)
+//   = do {
+//     key <- mir_fresh_cryptol_var "key" {| Aes::KeyBytes |};
+//     block <- mir_fresh_cryptol_var "block" {| BlockBytes |};
+//     mir_execute_func [mir_term key, mir_term block];
+//     mir_return (mir_term {{ toplevel_crypt key block }});
+//   };
+
+//   // Verify aes_verif::toplevel_encrypt_block_{128,192,256}.
+//   mir_verify m
+//     (str_concat "aes_verif::toplevel_encrypt_block_" key_size_str)
+//     [key_schedule_ov, encipher_ov]
+//     false
+//     (toplevel_crypt_spec {{ Aes::toplevel_encrypt_block }})
+//     (unint_z3 ["keyExpansion", "cipher"]);
+
+//   // Override for fixslice::inv_sub_bytes.
+//   inv_sub_bytes_ov <-
+//     mir_verify m "aes::soft::fixslice::inv_sub_bytes" [] false
+//       (mutate_state_slice_spec {{ Aes::inv_sub_bytes }}) rme;
+
+//   // Override for fixslice::inv_shift_rows_2. Note that the Cryptol
+//   // specification is not Aes::inv_shift_rows_2, which is defined as
+//   // Aes::shift_rows_2, which in turn is a bitsliced state transformation of
+//   // applying ShiftRows twice. Instead, we use a custom definition of applying
+//   // InvShiftRows twice. These are equivalent, but the decipher proof needs it
+//   // to be InvShiftRows instead of ShiftRows, so instead of doing a rewrite
+//   // later, we just do the override with a different spec now. (We can't just
+//   // change the definition of Aes::inv_shift_rows_2 on the Cryptol side, because
+//   // the key schedule proofs also rely on it, and they take twice as long to
+//   // verify if we change Aes::inv_shift_rows_2 to this definition.)
+//   inv_shift_rows_2_ov <-
+//     mir_verify m "aes::soft::fixslice::inv_shift_rows_2" [] false
+//       (mutate_state_slice_spec {{
+//         bitsliced
+//           (Aes::stateTransformation
+//             (\state ->
+//               Aes::Spec::InvShiftRows (Aes::Spec::InvShiftRows state)))
+//       }})
+//       rme;
+
+//   // Overrides for fixslice::inv_mix_columns_{0,1,2,3}.
+//   inv_mix_columns_ovs <- verify_mix_columns [
+//     ("inv_mix_columns_0", {{ Aes::inv_mix_columns_0 }}),
+//     ("inv_mix_columns_1", {{ Aes::inv_mix_columns_1 }}),
+//     ("inv_mix_columns_2", {{ Aes::inv_mix_columns_2 }}),
+//     ("inv_mix_columns_3", {{ Aes::inv_mix_columns_3 }})
+//   ];
+
+//   // The InvMixColumns{,1,2,3} Cryptol functions.
+//   let InvMixColumnsN = [
+//     {{ Aes::Spec::InvMixColumns }},
+//     {{ Aes::InvMixColumns1 }},
+//     {{ Aes::InvMixColumns2 }},
+//     {{ Aes::InvMixColumns3 }}
+//   ];
+
+//   // Rewrite rules to interchange SubBytesNots and InvMixColumns{0,1,2,3}.
+//   thms_SubBytesNots_InvMixColumnsN <-
+//     for InvMixColumnsN (\invMixColumns -> do {
+//       prove_print z3 {{
+//         \(state : Aes::Spec::State) ->
+//           Aes::SubBytesNots (invMixColumns state)
+//           == invMixColumns (Aes::SubBytesNots state)
+//       }};
+//     });
+
+//   // Rewrite rules to move @ inside
+//   // stateTransformation (InvSubBytes . SubBytesNots).
+//   thms_at_stateTransformation_InvSubBytes_SubBytesNots <-
+//     prove_at_stateTransformation {{
+//       \state -> Aes::Spec::InvSubBytes (Aes::SubBytesNots state)
+//     }};
+
+//   // Rewrite rules to move @ inside stateTransformation InvShiftRows2.
+//   thms_at_stateTransformation_InvShiftRows2 <-
+//     prove_at_stateTransformation {{
+//       \state -> Aes::Spec::InvShiftRows (Aes::Spec::InvShiftRows state)
+//     }};
+
+//   // Rewrite rules to move @ inside stateTransformation InvMixColumns{,1,2,3}.
+//   thms_at_stateTransformation_InvMixColumnsN <- do {
+//     nested <- for InvMixColumnsN prove_at_stateTransformation;
+//     return (concats nested);
+//   };
+
+//   // Rewrite rule to push SubBytesNots into the first argument of AddRoundKey.
+//   thm_SubBytesNots_AddRoundKey <- prove_print z3 {{
+//     \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+//       Aes::SubBytesNots (Aes::Spec::AddRoundKey w state)
+//       == Aes::Spec::AddRoundKey (Aes::SubBytesNots w) state
+//   }};
+
+//   // Rewrite rule to cancel out the ShiftRows and InvShiftRows around
+//   // AddRoundKey of InvSubBytes, by adding a ShiftRows to the round key.
+//   thm_ShiftRows_AddRoundKey_InvSubBytes_InvShiftRows <- prove_print z3 {{
+//     \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+//       Aes::Spec::ShiftRows
+//         (Aes::Spec::AddRoundKey w
+//           (Aes::Spec::InvSubBytes (Aes::Spec::InvShiftRows state)))
+//       == Aes::Spec::AddRoundKey
+//           (Aes::Spec::ShiftRows w)
+//           (Aes::Spec::InvSubBytes state)
+//   }};
+
+//   // Rewrite rule to change InvShiftRows2 of AddRoundKey of InvSubBytes of
+//   // ShiftRows into AddRoundKey of InvSubBytes of InvShiftRows, by adding a
+//   // ShiftRows2 to the round key.
+//   thm_InvShiftRows2_AddRoundKey_InvSubBytes_ShiftRows <- prove_print z3 {{
+//     \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+//       Aes::Spec::InvShiftRows
+//         (Aes::Spec::InvShiftRows
+//           (Aes::Spec::AddRoundKey w
+//             (Aes::Spec::InvSubBytes (Aes::Spec::ShiftRows state))))
+//       == Aes::Spec::AddRoundKey
+//           (Aes::Spec::ShiftRows (Aes::Spec::ShiftRows w))
+//           (Aes::Spec::InvSubBytes (Aes::Spec::InvShiftRows state))
+//   }};
+
+//   // Rewrite rule to change InvShiftRows of AddRoundKey of InvSubBytes into
+//   // AddRoundKey of InvSubBytes of InvShiftRows, by adding a InvShiftRows to the
+//   // round key.
+//   thm_InvShiftRows_AddRoundKey_InvSubBytes <- prove_print z3 {{
+//     \(w : Aes::Spec::RoundKey) (state : Aes::Spec::State) ->
+//       Aes::Spec::InvShiftRows
+//         (Aes::Spec::AddRoundKey w (Aes::Spec::InvSubBytes state))
+//       == Aes::Spec::AddRoundKey
+//           (Aes::Spec::InvShiftRows w)
+//           (Aes::Spec::InvSubBytes (Aes::Spec::InvShiftRows state))
+//   }};
+
+//   // Rewrite rule to interchange InvShiftRows and InvSubBytes.
+//   thm_InvShiftRows_InvSubBytes <- prove_print z3 {{
+//     \(state : Aes::Spec::State) ->
+//       Aes::Spec::InvShiftRows (Aes::Spec::InvSubBytes state)
+//       == Aes::Spec::InvSubBytes (Aes::Spec::InvShiftRows state)
+//   }};
+
+//   // Override for fixslice::aes{128,192,256}_decrypt.
+//   decipher_ov <-
+//     mir_verify m
+//       (str_concats ["aes::soft::fixslice::aes", key_size_str, "_decrypt"])
+//       (concats [
+//         add_round_key_ovs,
+//         inv_mix_columns_ovs,
+//         [
+//           key_schedule_ov,
+//           bitslice_cipher_ov,
+//           inv_bitslice_ov,
+//           inv_sub_bytes_ov,
+//           inv_shift_rows_2_ov
+//         ]
+//       ])
+//       false
+//       (cipher_spec {{ Aes::aes_decrypt }})
+//       do {
+//         unfolding [
+//           "add_round_key",
+//           "inv_sub_bytes",
+//           "inv_mix_columns_0",
+//           "inv_mix_columns_1",
+//           "inv_mix_columns_2",
+//           "inv_mix_columns_3",
+//           "inv_shift_rows_2",
+//           "bitsliced"
+//         ];
+
+//         // For this spec, SAW generates goals of the form `rust_output @ i ==
+//         // cryptol_spec @ i` for i = 0 to 3. We cancel out the adjacent
+//         // inv_bitslice and bitslice coming from adjacent uses of bitsliced,
+//         // then push the @ through all the steps in the rust_output, until we
+//         // have @ directly applied to the round keys and the batch blocks input,
+//         // and all the AES operations are operating on a single block. Then we
+//         // cancel out the adjacent split/join and transpose/transpose so that
+//         // everything is operating on the cryptol-specs State. We also move
+//         // SubBytesNots after MixColumnsN so that it is next to AddRoundKey, and
+//         // move InvShiftRows after InvSubBytes so that it matches the AES spec.
+//         simplify
+//           (addsimps
+//             (concats [
+//               thms_at_addRoundKey',
+//               thms_at_stateTransformation_InvSubBytes_SubBytesNots,
+//               thms_at_stateTransformation_InvShiftRows2,
+//               thms_at_stateTransformation_InvMixColumnsN,
+//               thms_SubBytesNots_InvMixColumnsN,
+//               [
+//                 thm_inv_bitslice_bitslice,
+//                 thm_split_join,
+//                 thm_transpose_transpose,
+//                 thm_InvShiftRows_InvSubBytes
+//               ]
+//             ])
+//             empty_ss);
+
+//         // Expand the ShiftRows and InvShiftRows from InvMixColumnsN.
+//         unfolding ["InvMixColumns1", "InvMixColumns2", "InvMixColumns3"];
+
+//         // For each call to AddRoundKey, we want its first argument to
+//         // correspond exactly to the inverse adjustments performed by
+//         // Aes::invBitsliceAdjustKeySchedule on the matching round key. We can
+//         // do this by moving all the SubBytesNots from the blocks to the round
+//         // keys, then adjusting ShiftRows/InvShiftRows accordingly so that the
+//         // round keys get shifted as well. Note that the order of
+//         // simplifications matters here.
+//         simplify (addsimp thm_SubBytesNots_AddRoundKey empty_ss);
+//         simplify
+//           (addsimp
+//             thm_InvShiftRows2_AddRoundKey_InvSubBytes_ShiftRows
+//             empty_ss);
+//         simplify
+//           (addsimps [
+//             thm_ShiftRows_AddRoundKey_InvSubBytes_InvShiftRows,
+//             thm_InvShiftRows_AddRoundKey_InvSubBytes
+//           ] empty_ss);
+
+//         // The sequence of AES operations now exactly matches the spec from
+//         // cryptol-specs. The solver should be able to verify this quickly with
+//         // the operations kept uninterpreted.
+//         unint_z3 [
+//           "AddRoundKey",
+//           "InvSubBytes",
+//           "InvShiftRows",
+//           "InvMixColumns"
+//         ];
+//       };
+
+//   // Verify aes_verif::toplevel_decrypt_block_{128,192,256}.
+//   mir_verify m
+//     (str_concat "aes_verif::toplevel_decrypt_block_" key_size_str)
+//     [key_schedule_ov, decipher_ov]
+//     false
+//     (toplevel_crypt_spec {{ Aes::toplevel_decrypt_block }})
+//     (unint_z3 ["keyExpansion", "invCipher"]);
+// };
+
+// // Spec for fixslice::bitslice, as used in aes128_key_schedule.
+// let bitslice_key_128_spec = do {
+//   rkeys_init <- mir_fresh_cryptol_var "rkeys_init" {| Aes128::FSRoundKeys |};
+//   rkeys_ref <- mir_ref_of_mut (mir_term rkeys_init);
+//   key <- mir_fresh_cryptol_var "key" {| Aes128::KeyBytes |};
+//   key_ref <- mir_ref_of (mir_term key);
+//   mir_execute_func [
+//     mir_slice_range_value rkeys_ref 0 8,
+//     mir_slice_value key_ref,
+//     mir_slice_value key_ref,
+//     mir_slice_value key_ref,
+//     mir_slice_value key_ref
+//   ];
+//   mir_points_to rkeys_ref (mir_term {{
+//     bitslice [key, key, key, key] # drop`{8} rkeys_init
+//   }});
+// };
+
+// bitslice_key_128_ov <-
+//   mir_verify m "aes::soft::fixslice::bitslice" [] false
+//     bitslice_key_128_spec rme;
+
+// // Verify AES-128, keeping SBox uninterpreted when verifying
+// // aes128_key_schedule. If SBox is expanded, it runs for a very long time
+// // (longer than verifying aes192_key_schedule with SBox expanded, for some
+// // reason).
+// verify_aes_size Aes128 KeySchedule128
+//   [bitslice_key_128_ov]
+//   (unint_z3 ["SBox"]);
+
+// // Spec for fixslice::bitslice, as used in the first call in
+// // aes192_key_schedule.
+// let bitslice_key_192_front_spec = do {
+//   rkeys_init <- mir_fresh_cryptol_var "rkeys_init" {| Aes192::FSRoundKeys |};
+//   rkeys_ref <- mir_ref_of_mut (mir_term rkeys_init);
+//   key <- mir_fresh_cryptol_var "key" {| Aes192::KeyBytes |};
+//   key_ref <- mir_ref_of (mir_term key);
+//   mir_execute_func [
+//     mir_slice_range_value rkeys_ref 0 8,
+//     mir_slice_range_value key_ref 0 16,
+//     mir_slice_range_value key_ref 0 16,
+//     mir_slice_range_value key_ref 0 16,
+//     mir_slice_range_value key_ref 0 16
+//   ];
+//   mir_points_to rkeys_ref (mir_term {{
+//     bitslice [take key, take key, take key, take key] # drop`{8} rkeys_init
+//   }});
+// };
+
+// bitslice_key_192_front_ov <-
+//   mir_verify m "aes::soft::fixslice::bitslice" [] false
+//     bitslice_key_192_front_spec rme;
+
+// // Spec for fixslice::bitslice, as used in the second call in
+// // aes192_key_schedule.
+// let bitslice_key_192_back_spec = do {
+//   tmp_init <- mir_fresh_cryptol_var "tmp_init" {| FSState |};
+//   tmp_ref <- mir_ref_of_mut (mir_term tmp_init);
+//   key <- mir_fresh_cryptol_var "key" {| Aes192::KeyBytes |};
+//   key_ref <- mir_ref_of (mir_term key);
+//   mir_execute_func [
+//     mir_slice_value tmp_ref,
+//     mir_slice_range_value key_ref 8 24,
+//     mir_slice_range_value key_ref 8 24,
+//     mir_slice_range_value key_ref 8 24,
+//     mir_slice_range_value key_ref 8 24
+//   ];
+//   mir_points_to tmp_ref (mir_term {{
+//     bitslice [drop key, drop key, drop key, drop key]
+//   }});
+// };
+
+// bitslice_key_192_back_ov <-
+//   mir_verify m "aes::soft::fixslice::bitslice" [] false
+//     bitslice_key_192_back_spec rme;
+
+// // Verify AES-192. For some reason keeping SBox uninterpreted doesn't work for
+// // the aes192_key_schedule proof, so we use regular z3.
+// verify_aes_size Aes192 KeySchedule192
+//   [bitslice_key_192_front_ov, bitslice_key_192_back_ov]
+//   z3;
+
+// // Spec for fixslice::bitslice, as used in the first call in
+// // aes256_key_schedule.
+// let bitslice_key_256_front_spec = do {
+//   rkeys_init <- mir_fresh_cryptol_var "rkeys_init" {| Aes256::FSRoundKeys |};
+//   rkeys_ref <- mir_ref_of_mut (mir_term rkeys_init);
+//   key <- mir_fresh_cryptol_var "key" {| Aes256::KeyBytes |};
+//   key_ref <- mir_ref_of (mir_term key);
+//   mir_execute_func [
+//     mir_slice_range_value rkeys_ref 0 8,
+//     mir_slice_range_value key_ref 0 16,
+//     mir_slice_range_value key_ref 0 16,
+//     mir_slice_range_value key_ref 0 16,
+//     mir_slice_range_value key_ref 0 16
+//   ];
+//   mir_points_to rkeys_ref (mir_term {{
+//     bitslice [take key, take key, take key, take key] # drop`{8} rkeys_init
+//   }});
+// };
+
+// bitslice_key_256_front_ov <-
+//   mir_verify m "aes::soft::fixslice::bitslice" [] false
+//     bitslice_key_256_front_spec rme;
+
+// // Spec for fixslice::bitslice, as used in the second call in
+// // aes256_key_schedule.
+// let bitslice_key_256_back_spec = do {
+//   rkeys_init <- mir_fresh_cryptol_var "rkeys_init" {| Aes256::FSRoundKeys |};
+//   rkeys_ref <- mir_ref_of_mut (mir_term rkeys_init);
+//   key <- mir_fresh_cryptol_var "key" {| Aes256::KeyBytes |};
+//   key_ref <- mir_ref_of (mir_term key);
+//   mir_execute_func [
+//     mir_slice_range_value rkeys_ref 8 16,
+//     mir_slice_range_value key_ref 16 32,
+//     mir_slice_range_value key_ref 16 32,
+//     mir_slice_range_value key_ref 16 32,
+//     mir_slice_range_value key_ref 16 32
+//   ];
+//   mir_points_to rkeys_ref (mir_term {{
+//       take`{8} rkeys_init
+//       # bitslice [drop key, drop key, drop key, drop key]
+//       # drop`{16} rkeys_init
+//   }});
+// };
+
+// bitslice_key_256_back_ov <-
+//   mir_verify m "aes::soft::fixslice::bitslice" [] false
+//     bitslice_key_256_back_spec rme;
+
+// // Verify AES-256. For some reason keeping SBox uninterpreted doesn't work for
+// // the aes256_key_schedule proof, so we use regular z3.
+// verify_aes_size Aes256 KeySchedule256
+//   [bitslice_key_256_front_ov, bitslice_key_256_back_ov]
+//   z3;
