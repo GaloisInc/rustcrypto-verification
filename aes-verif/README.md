@@ -1,7 +1,8 @@
 # AES
 
-Verification of encryption and decryption for AES-128, AES-192, and AES-256 from
-the [`aes`](https://crates.io/crates/aes/0.8.4) crate against the [AES
+Verification of the software implementations of encryption and decryption for
+AES-128, AES-192, and AES-256 from the
+[`aes`](https://crates.io/crates/aes/0.8.4) crate against the [AES
 specification](../cryptol-specs/Primitive/Symmetric/Cipher/Block/AES/Specification.cry)
 from `cryptol-specs`.
 
@@ -21,8 +22,13 @@ between the upstream crates and our forks, and since we have verified our forks
 to be correct, we can have high confidence that upstream `aes-0.8.4` is correct
 as well.
 
-The top-level Rust functions to be verified are in `src/lib.rs`. The Cryptol
-specs are in `AesVerif/`. The SAW proof is in `aes.saw`.
+The Cryptol specs and SAW proofs in this directory are also used as part of the
+verification of the `aes-gcm` library. Therefore, the SAW code is divided into a
+"library" file `aes-lib.saw` and a "driver" file `aes-run.saw`. All the real
+verification code is in `aes-lib.saw`, structured in a modular way that works
+with any MIR file containing the `aes` crate. `aes-run.saw` then includes
+`aes-lib.saw` and uses it to verify the top-level Rust functions defined in
+`src/lib.rs`. The Cryptol specs are in `AesVerif/`.
 
 ## Build
 
