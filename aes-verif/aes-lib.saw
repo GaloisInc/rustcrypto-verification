@@ -183,8 +183,6 @@ let aes_setup
       // The overrides for the bitslice function as used in the key schedule
       // function.
       (bitslice_key_ovs : [MIRSpec])
-      // The proof tactic for verifying the key schedule function.
-      (key_schedule_proof : ProofScript ())
       : TopLevel AesSize
   = do {
     // Key size as a string.
@@ -301,7 +299,9 @@ let aes_setup
           sub_bytes_nots_key_ovs,
           [sub_bytes_cipher_ov, sub_bytes_nots_tmp_ov]
         ])
-        false key_schedule_spec key_schedule_proof;
+        false
+        key_schedule_spec
+        (w4_unint_rme ["SBox"]);
     };
 
     // Spec for fixslice::add_round_key for the given round.
@@ -613,7 +613,7 @@ let aes_setup
           // The sequence of AES operations now exactly matches the spec from
           // cryptol-specs. The solver should be able to verify this quickly
           // with the operations kept uninterpreted.
-          unint_z3 [
+          w4_unint_rme [
             "AddRoundKey",
             "SubBytes",
             "ShiftRows",
@@ -826,7 +826,7 @@ let aes_setup
           // The sequence of AES operations now exactly matches the spec from
           // cryptol-specs. The solver should be able to verify this quickly
           // with the operations kept uninterpreted.
-          unint_z3 [
+          w4_unint_rme [
             "AddRoundKey",
             "InvSubBytes",
             "InvShiftRows",
@@ -867,14 +867,7 @@ let aes_setup
     verify "aes::soft::fixslice::bitslice" [] false
       bitslice_key_128_spec rme;
 
-  aes128 <- mk_aes_size
-    Aes128
-    AesKeySchedule128
-    [bitslice_key_128_ov]
-    // Keep SBox uninterpreted when verifying aes128_key_schedule. If SBox is
-    // expanded, it runs for a very long time (longer than verifying
-    // aes192_key_schedule with SBox expanded, for some reason).
-    (unint_z3 ["SBox"]);
+  aes128 <- mk_aes_size Aes128 AesKeySchedule128 [bitslice_key_128_ov];
 
   // Spec for fixslice::bitslice, as used in the first call in
   // aes192_key_schedule.
@@ -923,13 +916,9 @@ let aes_setup
     verify "aes::soft::fixslice::bitslice" [] false
       bitslice_key_192_back_spec rme;
 
-  aes192 <- mk_aes_size
-    Aes192
-    AesKeySchedule192
-    [bitslice_key_192_front_ov, bitslice_key_192_back_ov]
-    // For some reason keeping SBox uninterpreted doesn't work for the
-    // aes192_key_schedule proof, so we use regular z3.
-    z3;
+  aes192 <-
+    mk_aes_size Aes192 AesKeySchedule192
+      [bitslice_key_192_front_ov, bitslice_key_192_back_ov];
 
   // Spec for fixslice::bitslice, as used in the first call in
   // aes256_key_schedule.
@@ -980,13 +969,9 @@ let aes_setup
     verify "aes::soft::fixslice::bitslice" [] false
       bitslice_key_256_back_spec rme;
 
-  aes256 <- mk_aes_size
-    Aes256
-    AesKeySchedule256
-    [bitslice_key_256_front_ov, bitslice_key_256_back_ov]
-    // For some reason keeping SBox uninterpreted doesn't work for the
-    // aes256_key_schedule proof, so we use regular z3.
-    z3;
+  aes256 <-
+    mk_aes_size Aes256 AesKeySchedule256
+      [bitslice_key_256_front_ov, bitslice_key_256_back_ov];
 
   return { aes128 = aes128, aes192 = aes192, aes256 = aes256 };
 };
