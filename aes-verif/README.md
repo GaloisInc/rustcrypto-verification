@@ -43,4 +43,4 @@ RUSTFLAGS="--cfg aes_force_soft" cargo saw-build
 CRYPTOLPATH="../cryptol-specs" saw aes.saw
 ```
 
-The proof takes about 19 minutes to run on a M4 Mac.
+The proof takes about 4 minutes to run on a M4 Mac.

@@ -279,10 +279,6 @@ let aes_setup
         mir_return (mir_term {{ KeySchedule::key_schedule key }});
       };
 
-      print "Verifying key schedule might take a while";
-      // On a M4 Mac, this takes ~1 min for AES-128, ~5 min for AES-192, and ~9
-      // min for AES-256.
-
       // We don't actually need all of these overrides for each size (128 and
       // 256 don't need sub_bytes_cipher_ov and sub_bytes_nots_tmp_ov, while 192
       // doesn't need sub_bytes_key_ovs), but it's simpler to just pass all of
