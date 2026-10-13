@@ -4,4 +4,4 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-sha1 = { git = "https://github.com/RyanGlScott/hashes.git", package = "sha1", branch = "crucible-mir-patches", features = ["force-soft"] }
+sha1 = { git = "https://github.com/RyanGlScott/hashes.git", branch = "crucible-mir-patches", features = ["force-soft"] }
