@@ -1,0 +1,138 @@
+/**
+Cryptol specifications for the functions in `polyval::backend::soft` from the
+`polyval` crate on 64-bit platforms (`polyval/src/backend/soft64.rs`).
+*/
+module AesGcmVerif::Polyval where
+
+/**
+POLYVAL is defined as part of the AES-GCM-SIV specification. Note that
+AES-GCM-SIV is a different thing from AES-GCM, and we don't actually care about
+it except for the POLYVAL part. But since `cryptol-specs` has existing specs for
+POLYVAL multiplication in the `AES_GCM_SIV` module, we import it here instead of
+defining our own.
+
+The `AES_GCM_SIV` module is parameterized by the AES-GCM-SIV key size and AAD
+length, but the POLYVAL functions don't actually depend on them. However we
+still need to instantiate the parameterized module with *something* in order to
+access the POLYVAL specs. So here we arbitrarily choose the `KeySize` and `AAD`
+parameters. Importantly, these are completely unrelated to AES-GCM's key size
+and AAD parameters, and we can verify any instantiation of AES-GCM with these
+same POLYVAL specs.
+*/
+import Primitive::Symmetric::Cipher::Authenticated::AES_GCM_SIV
+  as Spec (dot, mult)
+  where
+    type KeySize = 128
+    type AAD = 0
+
+/**
+The size of a POLYVAL block in bytes.
+*/
+type NumBlockBytes = 16
+
+// There are three different representations of POLYVAL polynomials that we need
+// to convert between to write specs for the `polyval` crate functions. POLYVAL
+// polynomials are 128 bits (elements of GF(2^128)).
+
+/**
+Cryptol's native representation of a degree-127 polynomial, used by the `<| ...
+|>` literal and the built-in `pmult`/`pdiv`/`pmod` functions. A 128-bit
+bitvector where the leftmost bit is the `x^127` coefficient and the rightmost
+bit is the `x^0` coefficient. In other words, when interpreted as an unsigned
+integer, the bit at position `2^i` is the coefficient of `x^i`.
+*/
+type CryPoly = [128]
+/**
+The `polyval::Block` Rust type. Corresponds to the "128-bit string"
+representation of POLYVAL polynomials described in the [AES-GCM-SIV
+spec](https://datatracker.ietf.org/doc/html/rfc8452#section-3). The first byte
+contains the coefficients for `x^0` through `x^7`, the second byte contains the
+coefficients for `x^8` through `x^15`, and so on. Within each byte, the least
+significant bit is the lowest-power coefficient and the most significant bit is
+the highest-power coefficient. In other words, if the sequence of bytes is
+interpreted as a little-endian 128-bit unsigned integer, the bit at position
+`2^i` is the coefficient of `x^i`.
+*/
+type BlockPoly = [NumBlockBytes][8]
+/**
+The `polyval::backend::soft::U64x2` Rust type. Basically `polyval::Block` packed
+into two `u64`s to enable constant-time computation on them. The first `u64` has
+the coefficients for `x^0` through `x^63`, and the second `u64` has the
+coefficients for `x^64` through `x^127`. Within each `u64`, the least
+significant bit is the lowest-power coefficient and the most significant bit is
+the highest-power coefficient. On a little-endian machine, this should have the
+same physical representation as `polyval::Block`.
+*/
+type U64x2 = [2][64]
+
+/**
+Convert from the block representation to the Cryptol representation.
+*/
+blockToCry : BlockPoly -> CryPoly
+blockToCry p = join (reverse p)
+
+/**
+Convert from the Cryptol representation to the block representation.
+*/
+cryToBlock : CryPoly -> BlockPoly
+cryToBlock p = reverse (split p)
+
+/**
+Convert from the Cryptol representation to the `U64x2` representation.
+*/
+cryToU64x2 : CryPoly -> U64x2
+cryToU64x2 (p1 # p0) = [p0, p1]
+
+/**
+Convert from the `U64x2` representation to the Cryptol representation.
+*/
+u64x2ToCry : U64x2 -> CryPoly
+u64x2ToCry [p0, p1] = p1 # p0
+
+/**
+cryToU64x2 and u64x2ToCry should be inverses of each other.
+*/
+cryToU64x2ToCryIsId : CryPoly -> Bit
+property cryToU64x2ToCryIsId p = u64x2ToCry (cryToU64x2 p) == p
+
+/**
+Multiply a POLYVAL polynomial in the Cryptol representation by `x`, and reduce
+modulo the POLYVAL irreducible polynomial.
+*/
+mulXCryptol : CryPoly -> CryPoly
+mulXCryptol h = Spec::mult h <| x |>
+
+/**
+The `mulx_POLYVAL` function as defined in [Appendix A of the AES-GCM-SIV
+spec](https://datatracker.ietf.org/doc/html/rfc8452#appendix-A).
+
+Serves as a specification for the `polyval::mulx::mulx` function.
+*/
+mulX_POLYVAL : BlockPoly -> BlockPoly
+mulX_POLYVAL h = cryToBlock (mulXCryptol (blockToCry h))
+
+/**
+The `dot` operation on POLYVAL polynomials in the Cryptol representation. Not to
+be confused with the regular multiplication operation on POLYVAL polynomials
+(unlike GHASH, where • is multiplication).
+*/
+dot : CryPoly -> CryPoly -> CryPoly
+dot = Spec::dot
+
+/**
+`dot` operating on POLYVAL polynomials in the `U64x2` representation.
+
+Serves as a specification for `polyval::backend::soft::U64x2::mul`, which
+actually corresponds to `dot` and not `mul` in Cryptol.
+*/
+dotU64x2 : U64x2 -> U64x2 -> U64x2
+dotU64x2 a b = cryToU64x2 (dot (u64x2ToCry a) (u64x2ToCry b))
+
+/**
+Evaluate one iteration of the POLYVAL function. Given `H`, `S_i`, and `X_{i+1}`,
+this calculates `S_{i+1}`. 
+
+Serves as a specification for `polyval::backend::soft::Polyval::proc_block`.
+*/
+iter : U64x2 -> U64x2 -> BlockPoly -> U64x2
+iter h s x = cryToU64x2 (dot ((u64x2ToCry s) ^ (blockToCry x)) (u64x2ToCry h))

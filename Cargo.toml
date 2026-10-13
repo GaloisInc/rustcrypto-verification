@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["aes-verif", "sha1-verif", "sha2-verif"]
+members = ["aes-verif", "aes-gcm-verif", "sha1-verif", "sha2-verif"]
 
 [patch.crates-io]
 aes = { git = "https://github.com/RyanGlScott/block-ciphers.git", branch = "backport-hybrid-arrays-to-aes-0.8.4" }

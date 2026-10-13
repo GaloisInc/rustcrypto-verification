@@ -1,0 +1,454 @@
+// Verification of software-based authenticated encryption and authenticated
+// decryption from the Rust aes-gcm crate against the cryptol-specs
+// specification, for a variety of key sizes, IV sizes, tag sizes,
+// plaintext/ciphertext sizes, and AAD sizes.
+
+include_once "../utils/list.saw";
+include_once "../utils/typenum.saw";
+
+// Since the `aes_gcm` crate depends on the `aes` crate, we make use of our AES
+// verification specs and overrides.
+include_once "../aes-verif/aes-lib.saw";
+
+// The `aes-gcm` crate does not implement GHASH directly, but rather in terms of
+// a closely related function called POLYVAL.
+import AesGcmVerif::Polyval as Polyval;
+
+// We will abstract over these modules as CryptolModule objects, so we need to
+// import them with cryptol_load.
+Aes128_GCM <- cryptol_load "AesGcmVerif/Aes128_GCM.cry";
+Aes192_GCM <- cryptol_load "AesGcmVerif/Aes192_GCM.cry";
+Aes256_GCM <- cryptol_load "AesGcmVerif/Aes256_GCM.cry";
+
+m <- mir_load_module "../target/aes_gcm_verif.linked-mir.json";
+
+aes <- aes_setup m;
+let U = typenum_uint m;
+
+// The various parameters that we will verify `aes_gcm` for. The AES key sizes
+// and tag sizes are exhaustive (covers all possible values allowed by the
+// AES-GCM spec), and the IV, tag, and plaintext/ciphertext sizes are picked to
+// cover common values and edge cases. We verify all possible combinations of
+// these parameters.
+let aes_gcm_sizes = [
+  (Aes128_GCM, aes.aes128),
+  (Aes192_GCM, aes.aes192),
+  (Aes256_GCM, aes.aes256)
+];
+let iv_byte_sizes = [1, 8, 12, 16];
+let tag_byte_sizes = [12, 13, 14, 15, 16];
+let text_byte_sizes = [0, 1, 16, 20, 40];
+let aad_byte_sizes = [0, 1, 16, 20, 40];
+
+// Rust types used by functions in the aes-gcm crate and its dependencies.
+let AeadError = mir_find_adt m "aead::Error" [];
+let AeadResult t = mir_find_adt m "core::result::Result" [t, mir_adt AeadError];
+let GHash = mir_find_adt m "ghash::GHash" [];
+let Polyval = mir_find_adt m "polyval::backend::soft::Polyval" [];
+let U64x2 = mir_find_adt m "polyval::backend::soft::U64x2" [];
+let GenericArray = mir_find_adt m "generic_array::GenericArray";
+let polyval_block_byte_size = eval_size {| Polyval::NumBlockBytes |};
+let PolyvalBlock = GenericArray [mir_u8, mir_adt (U polyval_block_byte_size)];
+let PhantomData = mir_find_adt m "core::marker::PhantomData";
+
+// Spec for polyval::mulx::mulx.
+let polyval_mulx_spec = do {
+  v <- mir_fresh_cryptol_var "v" {| Polyval::BlockPoly |};
+  block <- mir_ref_of (mir_struct_value PolyvalBlock [mir_term v]);
+
+  mir_execute_func [block];
+
+  mir_return (mir_struct_value PolyvalBlock [
+    mir_term {{ Polyval::mulX_POLYVAL v }}
+  ]);
+};
+
+polyval_mulx_ov <-
+  mir_verify m "polyval::mulx::mulx" [] false polyval_mulx_spec rme;
+
+// Spec for polyval::backend::soft::bmul64.
+let polyval_bmul64_spec = do {
+  x <- mir_fresh_var "x" mir_u64;
+  y <- mir_fresh_var "y" mir_u64;
+
+  mir_execute_func [mir_term x, mir_term y];
+
+  mir_return (mir_term {{ drop (pmult x y) : [64] }});
+};
+
+polyval_bmul64_ov <-
+  mir_verify m "polyval::backend::soft::bmul64" [] false
+    polyval_bmul64_spec rme;
+
+// Spec for polyval::backend::soft::rev64.
+let polyval_rev64_spec = do {
+  x <- mir_fresh_var "x" mir_u64;
+
+  mir_execute_func [mir_term x];
+
+  mir_return (mir_term {{ reverse x }});
+};
+
+polyval_rev64_ov <-
+  mir_verify m "polyval::backend::soft::rev64" [] false polyval_rev64_spec rme;
+
+// Create a Rust U64x2 value from a Cryptol U64x2 term.
+let u64x2_term_to_mir (p : Term /* U64x2 */) =
+  mir_struct_value U64x2 (map mir_term (eval_list p));
+
+// Create a fresh U64x2 variable, and return both its Rust and Cryptol
+// representations.
+let fresh_U64x2 (name : String) : MIRSetup (MIRValue, Term /* U64x2 */) = do {
+  var0 <- mir_fresh_var (str_concat name ".0") mir_u64;
+  var1 <- mir_fresh_var (str_concat name ".1") mir_u64;
+  return (
+    mir_struct_value U64x2 [mir_term var0, mir_term var1],
+    {{ [var0, var1] }}
+  );
+};
+
+// Spec for polyval::backend::soft::U64x2::mul. Named dot here to prevent
+// confusion with the multiplication operation.
+let polyval_dot_spec = do {
+  (self_mir, self_term) <- fresh_U64x2 "self";
+  (rhs_mir, rhs_term) <- fresh_U64x2 "rhs";
+
+  mir_execute_func [self_mir, rhs_mir];
+
+  mir_return (u64x2_term_to_mir {{ Polyval::dotU64x2 self_term rhs_term }});
+};
+
+polyval_dot_ov <-
+  mir_verify m "polyval::backend::soft::{impl#11}::mul"
+    [polyval_bmul64_ov, polyval_rev64_ov] false
+    polyval_dot_spec rme;
+
+// Spec for polyval::backend::soft::Polyval::proc_block.
+let polyval_proc_block_spec = do {
+  (h_mir, h_term) <- fresh_U64x2 "h";
+  (s_mir, s_term) <- fresh_U64x2 "s";
+  x <- mir_fresh_cryptol_var "x" {| Polyval::BlockPoly |};
+  self_ref <- mir_ref_of_mut (mir_struct_value Polyval [h_mir, s_mir]);
+  x_ref <- mir_ref_of (mir_struct_value PolyvalBlock [mir_term x]);
+
+  mir_execute_func [self_ref, x_ref];
+
+  mir_points_to self_ref (mir_struct_value Polyval [
+    h_mir,
+    u64x2_term_to_mir {{ Polyval::iter h_term s_term x }}
+  ]);
+};
+
+polyval_proc_block_ov <-
+  mir_verify m "polyval::backend::soft::{impl#5}::proc_block"
+  [polyval_dot_ov] false
+  polyval_proc_block_spec rme;
+
+// The largest input size, in GHASH blocks, that GHASH will ever be called on in
+// this SAW run.
+let max_ghash_input_blocks =
+  // When len(IV) = 96 bits (12 bytes), GHASH is not used to calculate J0.
+  let max_iv_byte_size = maximum (remove_int 12 iv_byte_sizes) in
+  let max_text_byte_size = maximum text_byte_sizes in
+  let max_aad_byte_size = maximum aad_byte_sizes in
+  eval_size {|
+    max
+      // Maximum number of GHASH blocks for calculating J0.
+      (max_iv_byte_size /^ 16 + 1)
+      // Maximum number of GHASH blocks for calculating S.
+      (max_aad_byte_size /^ 16 + max_text_byte_size /^ 16 + 1)
+  |};
+
+// Rewrite rule to cancel out u64x2ToCry of cryToU64x2.
+thm_u64x2ToCry_cryToU64x2 <- prove_print rme {{ Polyval::cryToU64x2ToCryIsId }};
+
+// Rewrite rule to simplify [at p 0, at p 1] to p.
+thm_U64x2_lit_of_ats <-
+  prove_print rme
+    (rewrite (add_cryptol_defs ["eListSel"] empty_ss) {{
+      \(p : Polyval::U64x2) -> ([p0, p1] == p where [p0, p1] = p)
+    }});
+
+// Loop over all combinations of the various parameters we are testing.
+for aes_gcm_sizes (\(Aes_GCM, aes_size : AesSize) -> do {
+  let Aes = aes_size.Aes;
+  let KeySchedule = aes_size.KeySchedule;
+  let aes_key_byte_size = eval_size {| Aes::NumKeyBytes |};
+  let AesKeyArray = GenericArray [mir_u8, mir_adt (U aes_key_byte_size)];
+
+  aes_key_schedule_ov <- aes_size.verify_key_schedule;
+  aes_encipher_ov <- aes_size.verify_encipher;
+
+  // The Aes{128,192,256} Rust type from the aes crate.
+  let AesRust =
+    mir_find_adt m (str_concat "aes::soft::Aes" aes_size.key_size_str) [];
+
+  // Rewrite rule to convert POLYVAL to GHASH.
+  //
+  // The AES-GCM-SIV spec [1] describes how to convert between the POLYVAL and
+  // GHASH functions, and the Rust code uses this to express GHASH in terms of
+  // POLYVAL. We prove that equality here as a rewrite rule, so that we can
+  // rewrite the Rust side back to GHASH. Then we can compare it to the Cryptol
+  // side, which also uses GHASH, while keeping GHASH uninterpreted.
+  //
+  // The AES-GCM-SIV spec states:
+  //
+  //   GHASH(H, X_1, ..., X_n)
+  //   = ByteReverse(POLYVAL(mulX_POLYVAL(ByteReverse(H)), ByteReverse(X_1), ..., ByteReverse(X_n)))
+  //
+  // but the Rust code computes GHASH and POLYVAL incrementally. So we need to
+  // relate the individual dot operations. GHASH is defined as:
+  //
+  //   GHASH(H, X_1, ..., X_n) = Y_n
+  //   Y_0 = 0
+  //   Y_i = Y_{i-1} ^ X_i • H
+  //
+  // and POLYVAL is defined as (after substituting in GHASH's H and X_i):
+  //
+  //   POLYVAL(mulX_POLYVAL(ByteReverse(H)), ByteReverse(X_1), ... ByteReverse(X_n)) = S_n
+  //   S_0 = 0
+  //   S_i = dot(S_{i-1} ^ ByteReverse(X_i), mulX_POLYVAL(ByteReverse(H)))
+  //
+  // Now we have:
+  //
+  //   Y_i = ByteReverse(S_i)
+  //   Y_{i-1} ^ X_i • H
+  //   = ByteReverse(dot(S_{i-1} ^ ByteReverse(X_i), mulX_POLYVAL(ByteReverse(H))))
+  //   = ByteReverse(dot(ByteReverse(Y_{i-1}) ^ ByteReverse(X_i), mulX_POLYVAL(ByteReverse(H))))
+  //   = ByteReverse(dot(ByteReverse(Y_{i-1} ^ X_i), mulX_POLYVAL(ByteReverse(H))))
+  //
+  // This will basically be our rewrite rule. But in Cryptol we can actually
+  // simplify this further. The AesGcmVerif::Polyval Cryptol module describes
+  // several different representations of POLYVAL polynomials. In the above
+  // equation, the dot and mulX_POLYVAL functions are the ones from the
+  // AES-GCM-SIV spec, which use the BlockPoly representation. But we actually
+  // implement them in Cryptol in terms of the functions that use the CryPoly
+  // representation, so we can use Cryptol's built-in polynomial operations. The
+  // CryPoly representation is precisely the byte-reversed version of the
+  // BlockPoly representation. So in fact, we can get rid of all of the
+  // ByteReverse calls if we just expressed it in terms of the underlying
+  // CryPoly functions, Polyval::dot and Polyval::mulXCryptol:
+  //
+  //   Y_{i-1} ^ X_i • H = Polyval::dot(Y_{i-1} ^ X_i, Polyval::mulXCryptol(H))
+  //
+  // Generalizing it a bit and flipping the direction, we get the final rewrite
+  // rule.
+  //
+  // [1] https://datatracker.ietf.org/doc/html/rfc8452#appendix-A
+  thm_polyval_dot_mulx_as_ghash_dot <- prove_print rme {{
+    \a h -> Polyval::dot a (Polyval::mulXCryptol h) == a Aes_GCM::Spec::• h
+  }};
+
+  // Once we have the incremental • calls, we need to fold them up into a call
+  // to the actual GHASH function. This rewrite rule matches the base case, the
+  // first call to •.
+  thm_ghash_single <-
+    prove_print
+      (w4_unint_rme ["Aes_GCM::Spec::•"])
+      (rewrite (add_cryptol_defs ["ecNumber", "PLiteralSeqBool"] empty_ss) {{
+        \h x ->
+          (Polyval::u64x2ToCry [0, 0] ^ x) Aes_GCM::Spec::• h
+          == Aes_GCM::Spec::GHASH h x
+      }});
+
+  // A set of rewrite rules for the recursive case of folding up • into GHASH.
+  // Since each instantiation of GHASH has a distinct type, we need to create a
+  // separate rule for each iteration of the fold, up to the maximum number of
+  // blocks that GHASH is called on.
+  thms_ghash_fold <-
+    for (map eval_int (eval_list {{ [1 : [64] ..< max_ghash_input_blocks] }}))
+      (\n -> do {
+        prove_print (w4_unint_rme ["Aes_GCM::Spec::•"]) {{
+          \h x xs ->
+            (Aes_GCM::Spec::GHASH`{n} h xs ^ x) Aes_GCM::Spec::• h
+            == Aes_GCM::Spec::GHASH h (xs # x)
+        }};
+      });
+
+  // Proof for aes_gcm::AesGcm::{encrypt,decrypt}_in_place_detached.
+  let gcm_crypt_proof = do {
+    unfolding ["iter"];
+
+    // Simplify, convert POLYVAL's dot to GHASH's •, and fold it up into GHASH.
+    simplify
+      (addsimps thms_ghash_fold
+        (addsimps [
+          thm_u64x2ToCry_cryToU64x2,
+          thm_U64x2_lit_of_ats,
+          thm_polyval_dot_mulx_as_ghash_dot,
+          thm_ghash_single
+        ] empty_ss));
+
+    // Keep AES key expansion, AES cipher, and GHASH uninterpreted. Z3 performs
+    // much better than RME on the decrypt goals.
+    unint_z3 ["keyExpansion", "cipher", "GHASH"];
+  };
+
+  for iv_byte_sizes (\iv_byte_size -> do {
+    let iv_byte_size_type = mir_adt (U iv_byte_size);
+    let NonceArray = GenericArray [mir_u8, iv_byte_size_type];
+
+    for tag_byte_sizes (\tag_byte_size -> do {
+      let tag_byte_size_type = mir_adt (U tag_byte_size);
+      let TagArray = GenericArray [mir_u8, tag_byte_size_type];
+
+      // Type arguments that we will instantiate AesGcm (and its methods) with.
+      let gcm_type_args =
+        [mir_adt AesRust, iv_byte_size_type, tag_byte_size_type];
+
+      // The AesGcm Rust type from the aes_gcm crate.
+      let AesGcmRust = mir_find_adt m "aes_gcm::AesGcm" gcm_type_args;
+
+      // Create a Rust AesGcm value from a Cryptol AES key byte sequence.
+      let mk_AesGcm (k : Term /* Aes::KeyBytes */) =
+        // Fixsliced representation of the key.
+        let fs_keys = {{ KeySchedule::key_schedule k }} in
+        // Compute the H value for POLYVAL.
+        let h = {{ Polyval::mulXCryptol (Aes::Spec::encrypt (join k) 0) }} in
+        mir_struct_value AesGcmRust [
+          mir_struct_value AesRust [
+            mir_term fs_keys
+          ],
+          mir_struct_value GHash [
+            mir_struct_value Polyval [
+              // We fix H here, which is needed in the postcondition for
+              // verifying new, but not technically the most general spec in the
+              // precondition for verifying encrypt and decrypt. But in practice
+              // H should always be this value.
+              u64x2_term_to_mir {{ Polyval::cryToU64x2 h }},
+              // S is always 0 for the Polyval value inside AesGcm. Whenever the
+              // Rust code actually does POLYVAL computations, it clones the
+              // GHash object and mutably updates that clone's S value. At the
+              // end of the computation the cloned GHash is discarded, so this S
+              // is never updated.
+              u64x2_term_to_mir {{ zero : Polyval::U64x2 }}
+            ]
+          ],
+          mir_struct_value (PhantomData [iv_byte_size_type]) [],
+          mir_struct_value (PhantomData [tag_byte_size_type]) []
+        ];
+
+      // Spec for aes_gcm::AesGcm::new.
+      let AesGcm_new_spec = do {
+        k <- mir_fresh_cryptol_var "k" {| Aes::KeyBytes |};
+        key <- mir_ref_of (mir_struct_value AesKeyArray [mir_term k]);
+
+        mir_execute_func [key];
+
+        mir_return (mk_AesGcm k);
+      };
+
+      let AesGcm_new_id =
+        mir_find_name m "aes_gcm::{impl#2}::new" gcm_type_args;
+      mir_verify m AesGcm_new_id
+        [aes_key_schedule_ov, aes_encipher_ov, polyval_mulx_ov]
+        false
+        AesGcm_new_spec
+        (w4_unint_rme ["keyExpansion", "cipher", "mulXCryptol"]);
+
+      for text_byte_sizes (\text_byte_size -> do {
+        for aad_byte_sizes (\aad_byte_size -> do {
+          print (str_concats [
+            "Verifying encrypt/decrypt for: AES-", aes_size.key_size_str,
+            ", IV = ", show iv_byte_size,
+            " bytes, tag = ", show tag_byte_size,
+            " bytes, plaintext/ciphertext = ", show text_byte_size,
+            " bytes, AAD = ", show aad_byte_size, " bytes"
+          ]);
+
+          // Spec for aes_gcm::AesGcm::encrypt_in_place_detached.
+          let AesGcm_encrypt_in_place_detached_spec = do {
+            k <- mir_fresh_cryptol_var "k" {| Aes::KeyBytes |};
+            iv <- mir_fresh_var "iv" (mir_array iv_byte_size mir_u8);
+            p <- mir_fresh_var "p" (mir_array text_byte_size mir_u8);
+            aad <- mir_fresh_var "a" (mir_array aad_byte_size mir_u8);
+
+            self <- mir_ref_of (mk_AesGcm k);
+            nonce <- mir_ref_of (mir_struct_value NonceArray [mir_term iv]);
+            associated_data <- mir_ref_of (mir_term aad);
+            buffer <- mir_ref_of_mut (mir_term p);
+
+            mir_execute_func [
+              self,
+              nonce,
+              mir_slice_value associated_data,
+              mir_slice_value buffer
+            ];
+
+            // The Cryptol spec returns a pair of the ciphertext and the tag.
+            let c_t = {{
+              Aes_GCM::Spec::GCM_AE`{T=tag_byte_size * 8}
+                (join k) (join iv) (join p) (join aad)
+            }};
+
+            mir_points_to buffer (mir_term {{ split`{each=8} c_t.0 }});
+
+            mir_return (mir_enum_value (AeadResult (mir_adt TagArray)) "Ok" [
+              mir_struct_value TagArray [mir_term {{ split`{each=8} c_t.1 }}]
+            ]);
+          };
+
+          let AesGcm_encrypt_in_place_detached_id =
+            mir_find_name m "aes_gcm::{impl#5}::encrypt_in_place_detached"
+              gcm_type_args;
+          mir_verify m AesGcm_encrypt_in_place_detached_id
+            [aes_encipher_ov, polyval_proc_block_ov]
+            false
+            AesGcm_encrypt_in_place_detached_spec
+            gcm_crypt_proof;
+
+          // Spec for aes_gcm::AesGcm::decrypt_in_place_detached.
+          let AesGcm_decrypt_in_place_detached_spec = do {
+            k <- mir_fresh_cryptol_var "k" {| Aes::KeyBytes |};
+            iv <- mir_fresh_var "iv" (mir_array iv_byte_size mir_u8);
+            c <- mir_fresh_var "c" (mir_array text_byte_size mir_u8);
+            aad <- mir_fresh_var "a" (mir_array aad_byte_size mir_u8);
+            t <- mir_fresh_var "t" (mir_array tag_byte_size mir_u8);
+
+            self <- mir_ref_of (mk_AesGcm k);
+            nonce <- mir_ref_of (mir_struct_value NonceArray [mir_term iv]);
+            associated_data <- mir_ref_of (mir_term aad);
+            buffer <- mir_ref_of_mut (mir_term c);
+            tag <- mir_ref_of (mir_struct_value TagArray [mir_term t]);
+
+            mir_execute_func [
+              self,
+              nonce,
+              mir_slice_value associated_data,
+              mir_slice_value buffer,
+              tag
+            ];
+
+            let r = {{
+              Aes_GCM::Spec::GCM_AD
+                (join k) (join iv) (join c) (join aad) (join t)
+            }};
+
+            mir_points_to buffer (mir_term {{
+              case r of
+                Some p -> split`{each=8} p
+                None -> c
+            }});
+
+            // Return Ok(()) for success and Err(Error) for failure
+            mir_return
+              (mir_mux_values {{ case r of Some _ -> True; None -> False }}
+                (mir_enum_value (AeadResult (mir_tuple []))
+                  "Ok" [mir_tuple_value []])
+                (mir_enum_value (AeadResult (mir_tuple []))
+                  "Err" [mir_struct_value AeadError []]));
+          };
+
+          let AesGcm_decrypt_in_place_detached_id =
+            mir_find_name m "aes_gcm::{impl#5}::decrypt_in_place_detached"
+              gcm_type_args;
+          mir_verify m AesGcm_decrypt_in_place_detached_id
+            [aes_encipher_ov, polyval_proc_block_ov]
+            false
+            AesGcm_decrypt_in_place_detached_spec
+            gcm_crypt_proof;
+        });
+      });
+    });
+  });
+});

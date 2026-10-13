@@ -1,0 +1,6 @@
+module AesGcmVerif::Aes256_GCM where
+
+import AesVerif::Aes256 as Aes256
+
+submodule Spec = Primitive::Symmetric::Cipher::Authenticated::GCM::Specification
+  { submodule Aes256::Spec }

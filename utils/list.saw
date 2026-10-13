@@ -4,3 +4,23 @@ rec concats (xss : [[a]]) : [a] =
     []
   else
     concat (head xss) (concats (tail xss));
+
+// Remove all occurrences of an integer from a list of integers.
+rec remove_int (n : Int) (xs : [Int]) : [Int] =
+  if null xs then
+    []
+  else
+    let x = head xs in
+    if eval_bool {{ `x == `n }} then
+      remove_int n (tail xs)
+    else
+      concat [x] (remove_int n (tail xs));
+
+// Maximum of a list of non-negative integers. Returns 0 if the list is empty.
+rec maximum (xs : [Int]) : Int =
+  if null xs then
+    0
+  else
+    let h = head xs in
+    let t = maximum (tail xs) in
+    eval_size {| max h t |};
