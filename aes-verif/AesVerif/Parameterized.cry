@@ -59,9 +59,14 @@ submodule Spec = Primitive::Symmetric::Cipher::Block::AES::Specification where
   type KeySize' = KeySize
 
 /**
+The size of the key in bytes.
+*/
+type NumKeyBytes = Spec::Nk * 4
+
+/**
 An AES key as a byte array.
 */
-type KeyBytes = [Spec::Nk * 4][8]
+type KeyBytes = [NumKeyBytes][8]
 
 /**
 Fixsliced form of all the AES round keys. Corresponds to
