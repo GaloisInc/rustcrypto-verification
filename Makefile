@@ -1,5 +1,5 @@
 
-.PHONY: verify-aes verify-aes-gcm verify-sha1 verify-sha2
+.PHONY: clean verify-aes verify-aes-gcm verify-sha1 verify-sha2
 
 clean:
 	cargo clean
