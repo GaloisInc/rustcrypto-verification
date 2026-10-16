@@ -3,12 +3,13 @@
 // specification, for a variety of key sizes, IV sizes, tag sizes,
 // plaintext/ciphertext sizes, and AAD sizes.
 
-include_once "../utils/list.saw";
-include_once "../utils/typenum.saw";
-
 // Since the `aes_gcm` crate depends on the `aes` crate, we make use of our AES
 // verification specs and overrides.
 include_once "../aes-verif/aes-lib.saw";
+
+include_once "../utils/list.saw";
+include_once "../utils/string.saw";
+include_once "../utils/typenum.saw";
 
 // The `aes-gcm` crate does not implement GHASH directly, but rather in terms of
 // a closely related function called POLYVAL.
@@ -20,6 +21,8 @@ Aes128_GCM <- cryptol_load "AesGcmVerif/Aes128_GCM.cry";
 Aes192_GCM <- cryptol_load "AesGcmVerif/Aes192_GCM.cry";
 Aes256_GCM <- cryptol_load "AesGcmVerif/Aes256_GCM.cry";
 
+let IV_BYTES_ENV_VAR = "AES_GCM_SAW_IV_BYTES";
+
 m <- mir_load_module "../target/aes_gcm_verif.linked-mir.json";
 
 aes <- aes_setup m;
@@ -30,12 +33,23 @@ let U = typenum_uint m;
 // AES-GCM spec), and the IV, tag, and plaintext/ciphertext sizes are picked to
 // cover common values and edge cases. We verify all possible combinations of
 // these parameters.
+//
+// We allow the IV sizes to be overridden by an environment variable. If it is
+// set, we only verify the IV size specified by the environment variable. This
+// is mainly so that we can verify different IV sizes in different CI jobs in
+// parallel.
 let aes_gcm_sizes = [
   (Aes128_GCM, aes.aes128),
   (Aes192_GCM, aes.aes192),
   (Aes256_GCM, aes.aes256)
 ];
-let iv_byte_sizes = [1, 8, 12, 16];
+iv_byte_sizes <-
+  if has_env IV_BYTES_ENV_VAR then do {
+    iv <- parse_int (get_env IV_BYTES_ENV_VAR);
+    return [iv];
+  } else do {
+    return [1, 8, 12, 16];
+  };
 let tag_byte_sizes = [12, 13, 14, 15, 16];
 let text_byte_sizes = [0, 1, 16, 20, 40];
 let aad_byte_sizes = [0, 1, 16, 20, 40];

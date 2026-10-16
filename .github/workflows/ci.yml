@@ -35,7 +35,18 @@ jobs:
     needs: cargo-test
     strategy:
       matrix:
-        target: [verify-aes, verify-sha1, verify-sha2, verify-aes-gcm]
+        target:
+          - name: verify-aes
+          - name: verify-sha1
+          - name: verify-sha2
+          - name: verify-aes-gcm
+            iv-bytes: 1
+          - name: verify-aes-gcm
+            iv-bytes: 8
+          - name: verify-aes-gcm
+            iv-bytes: 12
+          - name: verify-aes-gcm
+            iv-bytes: 16
     container:
       image: ghcr.io/galoisinc/saw-suite:nightly
     steps:
@@ -44,9 +55,11 @@ jobs:
           submodules: true
 
       - name: Run SAW verification
+        env:
+          AES_GCM_SAW_IV_BYTES: ${{ matrix.target.iv-bytes }}
         run: |
           mir-json --version
           crux-mir --version
           saw --version
           cargo --version
-          make ${{ matrix.target }}
+          make ${{ matrix.target.name }}

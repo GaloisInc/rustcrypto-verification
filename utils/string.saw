@@ -1,0 +1,7 @@
+import Utils::StringUtils as StringUtils;
+
+let parse_int (s : String) : TopLevel Int =
+  if eval_bool {{ StringUtils::isIntString s }} then
+    return (eval_int {{ StringUtils::uncheckedParseInt s }})
+  else
+    fail (str_concat "parse_int: not an integer: " s);
